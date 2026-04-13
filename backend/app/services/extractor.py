@@ -317,10 +317,10 @@ def dedupe_and_clean_skills(rows: list[Skill]) -> list[Skill]:
         if len(name) < 2:
             continue
         
-        # Normalize proficiency_level
+        # Normalize proficiency_level and skip if unknown
         proficiency = (row.proficiency_level or "").strip() if row.proficiency_level else None
         if proficiency and proficiency.lower() in ["unknown", "n/a", "undefined", ""]:
-            proficiency = None
+            continue  # Skip skills with unknown proficiency
         
         # Validate years_of_experience
         years = row.years_of_experience
