@@ -19,3 +19,13 @@ def on_startup() -> None:
 
 
 app.include_router(upload_router)
+
+
+@app.get("/")
+def read_root() -> dict[str, str]:
+    return {"status": "TALASH backend is online"}
+
+
+@app.get("/health")
+def health_check() -> dict[str, str]:
+    return {"system": "healthy"}
