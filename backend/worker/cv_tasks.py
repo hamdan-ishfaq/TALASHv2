@@ -4,8 +4,11 @@ import logging
 from datetime import date, datetime
 
 from app.db import SessionLocal
-from app.models.models import Candidate, EducationRecord, WorkExperience
-from app.services.extractor import CVExtractorService, Candidate as ExtractedCandidate
+from app.models.models import (
+    Candidate, EducationRecord, WorkExperience, Publication, Skill,
+    Patent, Book, SupervisionRecord
+)
+from app.services.page_extractor import PageByPageExtractor
 from app.services.pdf_parser import extract_pdf_text
 from app.worker import celery_app
 
@@ -60,7 +63,7 @@ def _fallback_extraction(cv_text: str) -> ExtractedCandidate:
     return fallback_candidate
 
 
-def _generate_ai_summary(cv_text: str, host: str = "http://ollama:11434") -> str:
+def _generate_ai_summary(cv_text: str, host: str = "http://host.docker.internal:11434") -> str:
     """Generate summary using Ollama with timeout and error handling."""
     logger.info("[SUMMARY-STAGE] Starting AI summary generation")
     try:
@@ -80,7 +83,7 @@ def _generate_ai_summary(cv_text: str, host: str = "http://ollama:11434") -> str
                 {"role": "system", "content": "You are a precise hiring assistant."},
                 {"role": "user", "content": prompt},
             ],
-            options={"num_ctx": 4096, "temperature": 0.2},
+            options={"num_ctx": 2048, "temperature": 0.2, "num_gpu": 1},
         )
         summary = (response.get("message", {}) or {}).get("content", "").strip()
         logger.info("[SUMMARY-SUCCESS] Summary generated (%d chars)", len(summary))
@@ -131,15 +134,19 @@ def process_cv(self, candidate_id: int) -> dict[str, str | int]:
         extracted = None
         ollama_available = False
         try:
-            logger.debug("[STAGE-3] Initializing CVExtractorService with Ollama")
-            extractor = CVExtractorService(ollama_host="http://ollama:11434", model="llama3.1")
-            logger.info("[STAGE-3] Extractor service initialized")
+            logger.debug("[STAGE-3] Initializing PageByPageExtractor with Ollama")
+            page_extractor = PageByPageExtractor(
+                pdf_path=candidate.file_path,
+                model="llama3.1",
+                ollama_host="http://host.docker.internal:11434"
+            )
+            logger.info("[STAGE-3] Page extractor initialized")
             
-            logger.debug("[STAGE-3] Running two-pass extraction (Pass A + Pass B)")
-            extracted = extractor.extract(cv_text)
+            logger.debug("[STAGE-3] Starting page-by-page extraction")
+            extracted = page_extractor.extract_all_pages()
             ollama_available = True
             
-            logger.info("[STAGE-3-OK] LLM extraction successful | name=%s | edu_count=%d | exp_count=%d | pub_count=%d", 
+            logger.info("[STAGE-3-OK] Page-by-page extraction successful | name=%s | edu_count=%d | exp_count=%d | pub_count=%d", 
                        extracted.name, len(extracted.education), len(extracted.experience), len(extracted.publications))
         except Exception as extract_err:
             logger.warning("[STAGE-3-WARN] LLM extraction failed: %s | type=%s", str(extract_err), type(extract_err).__name__)
@@ -191,9 +198,109 @@ def process_cv(self, candidate_id: int) -> dict[str, str | int]:
                 is_current=bool(exp.is_current),
             ))
 
+        # Persist publications
+        logger.debug("[STAGE-4] Deleting old publication records")
+        db.query(Publication).filter(Publication.candidate_id == candidate.id).delete(
+            synchronize_session=False
+        )
+        logger.info("[STAGE-4] Inserting %d publication records", len(extracted.publications))
+        for i, pub in enumerate(extracted.publications, 1):
+            logger.debug("[STAGE-4-PUB-%d] title=%s | venue=%s | year=%s | type=%s | authors=%s", 
+                        i, pub.title, pub.venue, pub.year, pub.type, 
+                        ", ".join(pub.authors) if pub.authors else "N/A")
+            db.add(Publication(
+                candidate_id=candidate.id,
+                title=pub.title or "Untitled",
+                authors=", ".join(pub.authors) if pub.authors else None,
+                venue=pub.venue,
+                year=pub.year,
+                type=pub.type,
+            ))
+
+        # Persist skills (if extracted)
+        logger.debug("[STAGE-4] Deleting old skill records")
+        db.query(Skill).filter(Skill.candidate_id == candidate.id).delete(
+            synchronize_session=False
+        )
+        # Note: Skills are extracted in the ExtractedCandidate object
+        if hasattr(extracted, 'skills') and extracted.skills:
+            logger.info("[STAGE-4] Inserting %d skill records", len(extracted.skills))
+            for i, skill in enumerate(extracted.skills, 1):
+                logger.debug("[STAGE-4-SKILL-%d] name=%s | proficiency=%s | years=%s", 
+                            i, skill.name, skill.proficiency_level, skill.years_of_experience)
+                db.add(Skill(
+                    candidate_id=candidate.id,
+                    name=skill.name,
+                    proficiency_level=skill.proficiency_level,
+                    years_of_experience=skill.years_of_experience,
+                ))
+        else:
+            logger.info("[STAGE-4] No skills found to persist")
+
+        # Persist patents (if extracted)
+        logger.debug("[STAGE-4] Deleting old patent records")
+        db.query(Patent).filter(Patent.candidate_id == candidate.id).delete(
+            synchronize_session=False
+        )
+        if hasattr(extracted, 'patents') and extracted.patents:
+            logger.info("[STAGE-4] Inserting %d patent records", len(extracted.patents))
+            for i, patent in enumerate(extracted.patents, 1):
+                logger.debug("[STAGE-4-PATENT-%d] title=%s | inventors=%s | patent_no=%s | year=%s | status=%s", 
+                            i, patent.title, patent.inventors, patent.patent_no, patent.year, patent.status)
+                db.add(Patent(
+                    candidate_id=candidate.id,
+                    title=patent.title or "Untitled Patent",
+                    inventors=", ".join(patent.inventors) if patent.inventors else None,
+                    patent_no=patent.patent_no,
+                    year=patent.year,
+                    status=patent.status,
+                ))
+        else:
+            logger.info("[STAGE-4] No patents found to persist")
+
+        # Persist books (if extracted)
+        logger.debug("[STAGE-4] Deleting old book records")
+        db.query(Book).filter(Book.candidate_id == candidate.id).delete(
+            synchronize_session=False
+        )
+        if hasattr(extracted, 'books') and extracted.books:
+            logger.info("[STAGE-4] Inserting %d book records", len(extracted.books))
+            for i, book in enumerate(extracted.books, 1):
+                logger.debug("[STAGE-4-BOOK-%d] title=%s | authors=%s | publisher=%s | year=%s | isbn=%s", 
+                            i, book.title, book.authors, book.publisher, book.year, book.isbn)
+                db.add(Book(
+                    candidate_id=candidate.id,
+                    title=book.title or "Untitled Book",
+                    authors=", ".join(book.authors) if book.authors else None,
+                    publisher=book.publisher,
+                    year=book.year,
+                    isbn=book.isbn,
+                ))
+        else:
+            logger.info("[STAGE-4] No books found to persist")
+
+        # Persist supervision records (if extracted)
+        logger.debug("[STAGE-4] Deleting old supervision records")
+        db.query(SupervisionRecord).filter(SupervisionRecord.candidate_id == candidate.id).delete(
+            synchronize_session=False
+        )
+        if hasattr(extracted, 'supervision') and extracted.supervision:
+            logger.info("[STAGE-4] Inserting %d supervision records", len(extracted.supervision))
+            for i, supervision in enumerate(extracted.supervision, 1):
+                logger.debug("[STAGE-4-SUPER-%d] level=%s | student_name=%s | year=%s", 
+                            i, supervision.level, supervision.student_name, supervision.year)
+                db.add(SupervisionRecord(
+                    candidate_id=candidate.id,
+                    level=supervision.level,
+                    student_name=supervision.student_name,
+                    year=supervision.year,
+                ))
+        else:
+            logger.info("[STAGE-4] No supervision records found to persist")
+
         candidate.status = "core_saved"
         db.commit()
-        logger.info("[STAGE-4-OK] Core data committed to database")
+        logger.info("[STAGE-4-OK] Core data committed to database (including publications & skills)")
 
         logger.info("[STAGE-5] Commit 2: Generating AI summary")
         summary = _generate_ai_summary(cv_text)

@@ -32,6 +32,34 @@ class Publication(BaseModel):
     type: str | None = None
 
 
+class Skill(BaseModel):
+    name: str | None = None
+    proficiency_level: str | None = None
+    years_of_experience: float | None = None
+
+
+class Patent(BaseModel):
+    title: str | None = None
+    inventors: list[str] = Field(default_factory=list)
+    patent_no: str | None = None
+    year: int | None = None
+    status: str | None = None
+
+
+class Book(BaseModel):
+    title: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    publisher: str | None = None
+    year: int | None = None
+    isbn: str | None = None
+
+
+class SupervisionRecord(BaseModel):
+    level: str | None = None
+    student_name: str | None = None
+    year: int | None = None
+
+
 class Candidate(BaseModel):
     name: str | None = None
     email: str | None = None
@@ -39,6 +67,10 @@ class Candidate(BaseModel):
     education: list[Education] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
     publications: list[Publication] = Field(default_factory=list)
+    skills: list[Skill] = Field(default_factory=list)
+    patents: list[Patent] = Field(default_factory=list)
+    books: list[Book] = Field(default_factory=list)
+    supervision: list[SupervisionRecord] = Field(default_factory=list)
 
 
 class CVExtractionResult(BaseModel):
@@ -86,20 +118,37 @@ class CVExtractorService:
                 },
                 {"role": "user", "content": prompt},
             ],
-            extra_body={"options": {"num_ctx": 4096, "temperature": 0}},
+            extra_body={"options": {"num_ctx": 2048, "temperature": 0, "num_gpu": 1}},
         )
 
     def extract(self, cv_text: str) -> Candidate:
         # Pass A: focused extraction to boost precision on key headings.
         pass_a_prompt = f"""
-Extract Candidate, Education, Experience, and Publication details.
-Focus first on these headings (if present):
-- Personal Information / Profile / Contact
-- Education / Academic Background
-- Experience / Employment / Professional Experience
-- Publications / Research Output
+Extract ALL Candidate information including:
+- Personal Information / Profile / Contact (name: string, email: string)
+- Education / Academic Background (list of: degree, institution, year as 4-digit int, cgpa as float)
+- Experience / Employment (list of: job_title, organization, location, start_date, end_date, is_current as bool)
+- Publications / Research Output (list of: title, authors as LIST OF STRINGS ONLY (e.g. ['John Smith', 'Jane Doe']), venue as string (NOT number), year as 4-digit int)
+- Skills / Technical Skills (list of: name, proficiency_level, years_of_experience as float)
+- Patents / Inventions (list of: title, inventors as LIST OF STRINGS ONLY, patent_no, year, status)
+- Books / Book Authorship (list of: title, authors as LIST OF STRINGS ONLY, publisher, year, isbn)
+- Supervision / Student Mentoring (list of: level, student_name, year)
 
-Return only fields represented by the response schema.
+CRITICAL: 
+- Authors MUST be strings ONLY, never objects. Format: ['First Author', 'Second Author']
+- Venue MUST be a string, NEVER a number
+- Year fields MUST be 4-digit integers (2023), NOT other formats
+- Leave null/empty if not found
+
+Focus first on these section headings:
+- Personal Information / Profile
+- Education / Academic Background
+- Experience / Employment
+- Publications / Research Output
+- Skills / Technical Skills
+- Patents / Inventions
+- Books / Book Authorship
+- Supervision / Student Mentoring
 
 CV text:
 {cv_text}
@@ -109,8 +158,16 @@ CV text:
 
         # Pass B: full-text fallback to recover data pass A may miss.
         pass_b_prompt = f"""
-Extract Candidate, Education, Experience, and Publication details from the full CV text.
-Use this as a fallback pass to capture any missing fields.
+Extract from CV text: Candidate name, email, summary, education, experience, publications, skills, patents, books, and supervision records.
+Use this as a fallback pass to capture ANY missing fields from Pass A.
+
+SCHEMA FORMAT REQUIREMENTS:
+- publications[].authors: LIST OF STRINGS ['Author 1', 'Author 2'], NOT [{{'name': 'Author'}}]
+- publications[].venue: STRING like 'IEEE Journal', NEVER integer/number
+- years: 4-digit integers like 2023, NOT decimals or text
+- all other string fields: plain text, NOT nested objects
+
+Be thorough - extract ALL mentioned skills, publications, patents, and students.
 
 CV text:
 {cv_text}
@@ -130,6 +187,10 @@ CV text:
             education=[*primary.education, *fallback.education],
             experience=[*primary.experience, *fallback.experience],
             publications=[*primary.publications, *fallback.publications],
+            skills=[*primary.skills, *fallback.skills],
+            patents=[*primary.patents, *fallback.patents],
+            books=[*primary.books, *fallback.books],
+            supervision=[*primary.supervision, *fallback.supervision],
         )
 
         return merged
