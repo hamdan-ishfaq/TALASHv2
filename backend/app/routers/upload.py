@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models.models import Candidate
+from app.models.models import Candidate, EducationRecord, WorkExperience, Publication, SupervisionRecord, Book, Patent, Skill, CandidateScore
 from worker.cv_tasks import process_cv
 
 logger = logging.getLogger(__name__)
@@ -129,3 +129,118 @@ def upload_from_path(file_path: str, db: Session = Depends(get_db)) -> dict:
         "duplicate": False,
         "task_id": async_result.id,
     }
+
+
+@router.get("/candidates/{candidate_id}")
+def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
+    """Retrieve candidate data with all extracted information."""
+    logger.info("=" * 80)
+    logger.info("[GET-CANDIDATE] Retrieving candidate data | candidate_id=%s", candidate_id)
+    
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        logger.warning("[GET-CANDIDATE-FAIL] Candidate not found | candidate_id=%s", candidate_id)
+        raise HTTPException(status_code=404, detail=f"Candidate with ID {candidate_id} not found")
+    
+    logger.info("[GET-CANDIDATE-OK] Candidate found | name=%s | status=%s", candidate.name, candidate.status)
+    
+    # Build response with all extracted data
+    response = {
+        "id": candidate.id,
+        "name": candidate.name,
+        "email": candidate.email,
+        "status": candidate.status,
+        "file_hash": candidate.file_hash,
+        "file_path": candidate.file_path,
+        "raw_text": candidate.raw_text,
+        "summary": candidate.summary,
+        "education_records": [
+            {
+                "id": rec.id,
+                "degree_level": rec.degree_level,
+                "title": rec.title,
+                "institution": rec.institution,
+                "passing_year": rec.passing_year,
+                "cgpa": rec.cgpa,
+            }
+            for rec in candidate.education_records
+        ],
+        "work_experiences": [
+            {
+                "id": exp.id,
+                "job_title": exp.job_title,
+                "organization": exp.organization,
+                "location": exp.location,
+                "start_date": exp.start_date.isoformat() if exp.start_date else None,
+                "end_date": exp.end_date.isoformat() if exp.end_date else None,
+                "is_current": exp.is_current,
+            }
+            for exp in candidate.work_experiences
+        ],
+        "publications": [
+            {
+                "id": pub.id,
+                "title": pub.title,
+                "authors": pub.authors,
+                "venue": pub.venue,
+                "year": pub.year,
+                "type": pub.type,
+            }
+            for pub in candidate.publications
+        ],
+        "supervision_records": [
+            {
+                "id": rec.id,
+                "level": rec.level,
+                "student_name": rec.student_name,
+                "year": rec.year,
+            }
+            for rec in candidate.supervision_records
+        ],
+        "books": [
+            {
+                "id": book.id,
+                "title": book.title,
+                "authors": book.authors,
+                "publisher": book.publisher,
+                "year": book.year,
+                "isbn": book.isbn,
+            }
+            for book in candidate.books
+        ],
+        "patents": [
+            {
+                "id": patent.id,
+                "title": patent.title,
+                "inventors": patent.inventors,
+                "patent_no": patent.patent_no,
+                "year": patent.year,
+                "status": patent.status,
+            }
+            for patent in candidate.patents
+        ],
+        "skills": [
+            {
+                "id": skill.id,
+                "name": skill.name,
+                "proficiency_level": skill.proficiency_level,
+                "years_of_experience": skill.years_of_experience,
+            }
+            for skill in candidate.skills
+        ],
+        "scores": [
+            {
+                "id": score.id,
+                "score_type": score.score_type,
+                "score": score.score,
+                "max_score": score.max_score,
+                "notes": score.notes,
+            }
+            for score in candidate.scores
+        ],
+    }
+    
+    logger.info("[GET-CANDIDATE-COMPLETE] Response prepared with all data")
+    logger.info("=" * 80)
+    
+    return response

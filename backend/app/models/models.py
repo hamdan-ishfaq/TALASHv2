@@ -74,7 +74,27 @@ class Publication(Base):
     authors = Column(Text, nullable=True)
     venue = Column(String(255), nullable=True)
     year = Column(Integer, nullable=True)
-    type = Column(String(100), nullable=True)
+    type = Column(String(100), nullable=True)  # 'journal', 'conference', 'workshop'
+    
+    # Journal-specific fields
+    issn = Column(String(50), nullable=True)
+    wos_indexed = Column(Boolean, default=False, nullable=True)
+    scopus_indexed = Column(Boolean, default=False, nullable=True)
+    quartile = Column(String(10), nullable=True)  # Q1, Q2, Q3, Q4
+    wos_impact_factor = Column(Float, nullable=True)
+    
+    # Conference-specific fields (NEW - for Module 3.2.ii)
+    conference_a_star = Column(Boolean, default=False, nullable=True)
+    conference_a_ranking = Column(String(10), nullable=True)  # A, B, C, unranked
+    conference_core_ranking = Column(String(50), nullable=True)  # CORE ranking from portal.core.edu.au
+    conference_series_number = Column(String(100), nullable=True)  # e.g., "28th IEEE International"
+    proceedings_indexed_ieee = Column(Boolean, default=False, nullable=True)
+    proceedings_indexed_acm = Column(Boolean, default=False, nullable=True)
+    proceedings_indexed_springer = Column(Boolean, default=False, nullable=True)
+    
+    # Authorship role fields
+    author_position = Column(Integer, nullable=True)  # Position in author list (1, 2, 3...)
+    corresponding_author = Column(Boolean, default=False, nullable=True)
 
     candidate = relationship("Candidate", back_populates="publications")
 
@@ -142,3 +162,23 @@ class CandidateScore(Base):
     notes = Column(Text, nullable=True)
 
     candidate = relationship("Candidate", back_populates="scores")
+
+
+class PublicationTopic(Base):
+    """
+    Table for Module 3.6: Topic Variability in Publications
+    Stores keywords/topics for each publication to enable:
+    - Thematic clustering capability
+    - Diversity score calculation
+    - Topic variability analysis
+    """
+    __tablename__ = "publication_topics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    publication_id = Column(Integer, ForeignKey("publications.id"), nullable=False, index=True)
+    topic_name = Column(String(255), nullable=False)
+    topic_category = Column(String(100), nullable=True)  # e.g., "ML", "CV", "NLP", "Networks", "Security"
+    relevance_score = Column(Float, nullable=True)  # Confidence 0-100%
+    is_primary_topic = Column(Boolean, default=False, nullable=True)  # True if main research focus
+    
+    publication = relationship("Publication", backref="topics")
