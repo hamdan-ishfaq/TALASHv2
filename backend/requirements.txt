@@ -6,6 +6,7 @@ celery
 flower
 redis
 instructor
+litellm
 ollama
 PyMuPDF
 pdfplumber

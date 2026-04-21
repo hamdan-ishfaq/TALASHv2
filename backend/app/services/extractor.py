@@ -1,482 +1,363 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeVar
 import logging
 import re
-from datetime import datetime
 
-import instructor
-from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from app.schemas.extraction import (
+    AcademicProfileExtraction,
+    CandidateExtraction,
+    CoreProfileExtraction,
+    SkillsAndIPExtraction,
+)
+from app.services.llm_router import llm_router
 
 logger = logging.getLogger(__name__)
 
-
-class Education(BaseModel):
-    degree: str | None = None
-    title: str | None = None
-    institution: str | None = None
-    year: int | None = None
-    cgpa: float | None = None
+TModel = TypeVar("TModel", bound=BaseModel)
 
 
-class Experience(BaseModel):
-    job_title: str | None = None
-    organization: str | None = None
-    location: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    is_current: bool | None = None
-
-
-class Publication(BaseModel):
-    title: str | None = None
-    authors: list[str] = Field(default_factory=list)
-    venue: str | None = None
-    year: int | None = None
-    type: str | None = None
-
-
-class Skill(BaseModel):
-    name: str | None = None
-    proficiency_level: str | None = None
-    years_of_experience: float | None = None
-
-
-class Patent(BaseModel):
-    title: str | None = None
-    inventors: list[str] = Field(default_factory=list)
-    patent_no: str | None = None
-    year: int | None = None
-    status: str | None = None
-
-
-class Book(BaseModel):
-    title: str | None = None
-    authors: list[str] = Field(default_factory=list)
-    publisher: str | None = None
-    year: int | None = None
-    isbn: str | None = None
-
-
-class SupervisionRecord(BaseModel):
-    level: str | None = None
-    student_name: str | None = None
-    year: int | None = None
-
-
-class Candidate(BaseModel):
-    name: str | None = None
-    email: str | None = None
-    summary: str | None = None
-    education: list[Education] = Field(default_factory=list)
-    experience: list[Experience] = Field(default_factory=list)
-    publications: list[Publication] = Field(default_factory=list)
-    skills: list[Skill] = Field(default_factory=list)
-    patents: list[Patent] = Field(default_factory=list)
-    books: list[Book] = Field(default_factory=list)
-    supervision: list[SupervisionRecord] = Field(default_factory=list)
-
-
-class CVExtractionResult(BaseModel):
-    candidate: Candidate
-
-
-def dedupe_education_rows(rows: list[Education]) -> list[Education]:
-    """Remove duplicate education entries by (degree, institution, year)."""
-    deduped: list[Education] = []
-    seen: set[tuple[str, str, int | None]] = set()
-
-    for row in rows:
-        # Skip rows with no meaningful data
-        if not row.degree and not row.institution:
-            continue
-        
-        key = (
-            (row.degree or "").strip().lower(),
-            (row.institution or "").strip().lower(),
-            row.year,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
-
-    return deduped
-
-
-def dedupe_and_clean_publications(rows: list[Publication]) -> list[Publication]:
-    """Remove duplicate publications and clean noisy entries."""
-    cleaned: list[Publication] = []
-    seen: set[tuple[str, str, int | None]] = set()
-
-    for row in rows:
-        # Skip placeholder/empty entries
-        if not row.title or row.title.lower() in ["publication", "paper", "research"]:
-            continue
-        
-        # Clean title (remove extra spaces, normalize)
-        title = (row.title or "").strip()
-        if len(title) < 5:
-            continue
-        
-        # Normalize venue (remove "journal", "conference" prefix if suspicious)
-        venue = (row.venue or "").strip() if row.venue else ""
-        
-        # Skip if venue is numeric or clearly malformed
-        if venue and (venue.isdigit() or len(venue) > 200):
-            venue = ""
-        
-        # Normalize authors (remove empty strings)
-        authors = [a.strip() for a in (row.authors or []) if a and a.strip()]
-        
-        key = (
-            title.lower(),
-            venue.lower(),
-            row.year,
-        )
-        
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        cleaned.append(Publication(
-            title=title,
-            authors=authors,
-            venue=venue if venue else None,
-            year=row.year,
-            type=row.type
-        ))
-
-    return cleaned
-
-
-def dedupe_and_clean_experience(rows: list[Experience]) -> list[Experience]:
-    """Remove duplicate experience entries and fill incomplete values."""
-    cleaned: list[Experience] = []
-    seen: set[tuple[str, str, str]] = set()
-
-    for row in rows:
-        # Skip placeholder entries
-        if not row.job_title and not row.organization:
-            continue
-        
-        # Clean strings
-        job_title = (row.job_title or "").strip()
-        org = (row.organization or "").strip()
-        location = (row.location or "").strip()
-
-        # Skip obviously malformed entries
-        if len(job_title) < 2 and len(org) < 2:
-            continue
-        
-        key = (
-            job_title.lower(),
-            org.lower(),
-            location.lower(),
-        )
-        
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        cleaned.append(Experience(
-            job_title=job_title if job_title else None,
-            organization=org if org else None,
-            location=location if location else None,
-            start_date=row.start_date,
-            end_date=row.end_date,
-            is_current=row.is_current
-        ))
-
-    return cleaned
-
-
-def dedupe_publications(rows: list[Publication]) -> list[Publication]:
-    """Remove duplicate publications by (title, venue, year)."""
-    deduped: list[Publication] = []
-    seen: set[tuple[str, str, int | None]] = set()
-
-    for row in rows:
-        key = (
-            (row.title or "").strip().lower(),
-            (row.venue or "").strip().lower(),
-            row.year,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
-
-    return deduped
-
-
-def dedupe_and_clean_patents(rows: list[Patent]) -> list[Patent]:
-    """Remove duplicate patents and clean noisy entries."""
-    cleaned: list[Patent] = []
-    seen: set[tuple[str, str, int | None]] = set()
-
-    for row in rows:
-        # Skip if no title
-        if not row.title or not (row.title or "").strip():
-            continue
-        
-        title = (row.title or "").strip()
-        if len(title) < 3:
-            continue
-        
-        # Clean inventors list - ensure strings only
-        inventors = []
-        if row.inventors:
-            for inv in row.inventors:
-                if inv and isinstance(inv, str):
-                    inv_clean = inv.strip()
-                    if len(inv_clean) > 2:
-                        inventors.append(inv_clean)
-        
-        # Skip if no inventors
-        if not inventors:
-            continue
-        
-        patent_no = (row.patent_no or "").strip() if row.patent_no else None
-        status = (row.status or "").strip() if row.status else None
-        
-        key = (title.lower(), ",".join(inventors).lower(), row.year)
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        cleaned.append(Patent(
-            title=title,
-            inventors=inventors,
-            patent_no=patent_no if patent_no else None,
-            year=row.year,
-            status=status if status else None
-        ))
-
-    return cleaned
-
-
-def dedupe_and_clean_books(rows: list[Book]) -> list[Book]:
-    """Remove duplicate books and clean noisy entries."""
-    cleaned: list[Book] = []
-    seen: set[tuple[str, str, int | None]] = set()
-
-    for row in rows:
-        # Skip if no title
-        if not row.title or not (row.title or "").strip():
-            continue
-        
-        title = (row.title or "").strip()
-        if len(title) < 3:
-            continue
-        
-        # Clean authors list - ensure strings only
-        authors = []
-        if row.authors:
-            for auth in row.authors:
-                if auth and isinstance(auth, str):
-                    auth_clean = auth.strip()
-                    if len(auth_clean) > 2:
-                        authors.append(auth_clean)
-        
-        # Skip if no authors
-        if not authors:
-            continue
-        
-        publisher = (row.publisher or "").strip() if row.publisher else None
-        isbn = (row.isbn or "").strip() if row.isbn else None
-        
-        key = (title.lower(), ",".join(authors).lower(), row.year)
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        cleaned.append(Book(
-            title=title,
-            authors=authors,
-            publisher=publisher if publisher else None,
-            year=row.year,
-            isbn=isbn if isbn else None
-        ))
-
-    return cleaned
-
-
-def dedupe_and_clean_skills(rows: list[Skill]) -> list[Skill]:
-    """Remove duplicate skills and clean noisy entries."""
-    cleaned: list[Skill] = []
-    seen: set[str] = set()
-
-    for row in rows:
-        # Skip if no name
-        if not row.name or not (row.name or "").strip():
-            continue
-        
-        name = (row.name or "").strip()
-        if len(name) < 2:
-            continue
-        
-        # Normalize proficiency_level and skip if unknown
-        proficiency = (row.proficiency_level or "").strip() if row.proficiency_level else None
-        if proficiency and proficiency.lower() in ["unknown", "n/a", "undefined", ""]:
-            continue  # Skip skills with unknown proficiency
-        
-        # Validate years_of_experience
-        years = row.years_of_experience
-        if years is not None and years < 0:
-            years = None
-        
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        cleaned.append(Skill(
-            name=name,
-            proficiency_level=proficiency,
-            years_of_experience=years
-        ))
-
-    return cleaned
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+PHONE_PATTERN = re.compile(
+    r"(?<!\w)(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{1,4}\)?[\s.-]?)?\d[\d\s().-]{6,}\d(?!\w)"
+)
+LINKEDIN_PATTERN = re.compile(
+    r"(?:https?://)?(?:[a-z]{2,3}\.)?linkedin\.com/[A-Za-z0-9\-_/?.=&%]+",
+    flags=re.IGNORECASE,
+)
+RAW_TEXT_HEADER_PATTERN = re.compile(r"^\s*=+\s*RAW_TEXT(?:\s*\([^\)]*\))?\s*=+\s*$", re.IGNORECASE)
+PAGE_NUMBER_PATTERN = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*/\s*\d+)?\s*$", re.IGNORECASE)
+STRUCTURAL_ARTIFACT_PATTERN = re.compile(
+    r"^\s*(?:---+|___+|\*\*\*+|\|\s*\|.*\|\s*\|)\s*$"
+)
 
 
 class CVExtractorService:
-    def __init__(self, ollama_host: str = "http://localhost:11434", model: str = "llama3.1"):
-        self.model = model
-        base_url = f"{ollama_host.rstrip('/')}/v1"
-        self._base_client = OpenAI(base_url=base_url, api_key="ollama")
-        self.client = instructor.from_openai(self._base_client, mode=instructor.Mode.JSON)
+    def __init__(self):
+        self.client, self.model = llm_router.get_structured_client()
+        self.provider = getattr(llm_router, "provider", "litellm-router")
+        logger.info(
+            "CVExtractorService initialized | Model: %s | Provider: %s",
+            self.model,
+            self.provider,
+        )
 
-    def _extract_pass(self, prompt: str) -> CVExtractionResult:
-        """Extract with robust error handling for model endpoint unavailability."""
+    @staticmethod
+    def _clean_phone(raw_phone: str | None) -> str | None:
+        if not raw_phone:
+            return None
+        compact = re.sub(r"\s+", " ", raw_phone).strip()
+        compact = compact.rstrip(".,;:")
+        return compact
+
+    @staticmethod
+    def _sanitize_cv_text(cv_text: str) -> str:
+        """Remove parser/debug artifacts before any LLM call is made."""
+        cleaned_lines: list[str] = []
+        for raw_line in cv_text.splitlines():
+            line = raw_line.replace("\x00", "").rstrip()
+            stripped = line.strip()
+            if not stripped:
+                cleaned_lines.append("")
+                continue
+            if RAW_TEXT_HEADER_PATTERN.match(stripped):
+                continue
+            if PAGE_NUMBER_PATTERN.match(stripped):
+                continue
+            if STRUCTURAL_ARTIFACT_PATTERN.match(stripped):
+                continue
+            if re.fullmatch(r"[-_=]{10,}", stripped):
+                continue
+            cleaned_lines.append(line)
+        sanitized = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
+        return sanitized
+
+    @staticmethod
+    def _extract_contact_hints(cv_text: str) -> dict[str, str | None]:
+        email_match = EMAIL_PATTERN.search(cv_text)
+        phone_match = PHONE_PATTERN.search(cv_text)
+        linkedin_match = LINKEDIN_PATTERN.search(cv_text)
+
+        linkedin_url = None
+        if linkedin_match:
+            linkedin_url = linkedin_match.group(0).strip()
+            if not linkedin_url.lower().startswith("http"):
+                linkedin_url = f"https://{linkedin_url}"
+
+        return {
+            "email": email_match.group(0).strip() if email_match else None,
+            "phone": CVExtractorService._clean_phone(phone_match.group(0)) if phone_match else None,
+            "linkedin_url": linkedin_url,
+        }
+
+    @staticmethod
+    def _extract_contact_info_regex(text: str) -> dict[str, str | None]:
+        """Aggressively hunt for contact info using regex to override LLM hallucinations."""
+        reference_split = re.split(r"\breferences?\b", text, maxsplit=1, flags=re.IGNORECASE)
+        search_zone = reference_split[0][:2000]
+
+        email_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", search_zone)
+        email = email_match.group(0) if email_match else None
+
+        phone_match = re.search(
+            r"(?:(?:\+|00)\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}",
+            search_zone,
+        )
+        phone = CVExtractorService._clean_phone(phone_match.group(0)) if phone_match else None
+
+        linkedin_match = re.search(
+            r"(?:https?://)?(?:www\.)?linkedin\.com/in/([a-zA-Z0-9_-]+)",
+            search_zone,
+            re.IGNORECASE,
+        )
+        linkedin_url = (
+            f"https://www.linkedin.com/in/{linkedin_match.group(1)}" if linkedin_match else None
+        )
+
+        return {
+            "email": email,
+            "phone": phone,
+            "linkedin_url": linkedin_url,
+        }
+
+    @staticmethod
+    def _first_clean_capitalized_phrase(cv_text: str) -> str:
+        for line in cv_text.splitlines()[:40]:
+            token = re.sub(r"\s+", " ", line).strip()
+            if not token:
+                continue
+            if any(marker in token.lower() for marker in ["raw_text", "page", "curriculum vitae", "resume"]):
+                continue
+            if len(token) > 90:
+                continue
+            if re.search(r"[A-Za-z]", token) and token == token.title():
+                return token
+            if re.fullmatch(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){1,4}", token):
+                return token
+        return "Unknown Candidate"
+
+    @staticmethod
+    def _is_malformed_name(name: str | None) -> bool:
+        """Check if a name appears to be malformed or a debug header."""
+        if not name:
+            return False
+        name_lower = name.lower()
+        suspicious_patterns = [
+            "===",
+            "raw_text",
+            "page ",
+            "pdfmupdf",
+            "ocr",
+            "extraction",
+            "failed",
+            "error",
+            "none",
+            "null",
+            "[",
+            "{",
+            "pdfplumber",
+            "text layer",
+        ]
+        return any(pattern in name_lower for pattern in suspicious_patterns) or len(name.strip()) > 90
+
+    @staticmethod
+    def _guess_name_from_text(cv_text: str) -> str:
+        return CVExtractorService._first_clean_capitalized_phrase(cv_text)
+
+    def _structured_extract(
+        self,
+        response_model: type[TModel],
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        timeout: int,
+    ) -> TModel | None:
         try:
             return self.client.chat.completions.create(
                 model=self.model,
-                response_model=CVExtractionResult,
+                response_model=response_model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You extract structured CV data into JSON. "
-                            "Prefer factual values from the text. "
-                            "Leave unknown values as null or empty arrays."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
-                extra_body={"options": {"num_ctx": 2048, "temperature": 0, "num_gpu": 1}},
+                temperature=0,
+                max_retries=2,
+                max_tokens=max_tokens,
+                timeout=timeout,
             )
-        except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error(f"Model endpoint unavailable: {str(e)}. Returning empty result.")
-            # Return empty extraction result - will be merged/deduped gracefully
-            return CVExtractionResult(candidate=Candidate())
-        except Exception as e:
-            logger.error(f"Unexpected extraction error: {str(e)}. Returning empty result.")
-            return CVExtractionResult(candidate=Candidate())
+        except Exception as exc:
+            logger.error(
+                "Structured extraction failed for %s on %s: %s",
+                response_model.__name__,
+                self.provider,
+                str(exc),
+            )
+            return None
 
-    def extract(self, cv_text: str) -> Candidate:
-        """
-        Two-pass extraction with quality control:
-        - Pass A: Strict extraction with format validation
-        - Pass B: Fallback/recovery extraction
-        - Merge with deduplication and cleaning
-        """
-        try:
-            # Pass A: focused extraction to boost precision on key headings.
-            pass_a_prompt = f"""
-Extract ALL Candidate information including:
-- Personal Information / Profile / Contact (name: string, email: string)
-- Education / Academic Background (list of: degree, institution, year as 4-digit int, cgpa as float)
-- Experience / Employment (list of: job_title, organization, location, start_date, end_date, is_current as bool)
-- Publications / Research Output (list of: title, authors as LIST OF STRINGS ONLY (e.g. ['John Smith', 'Jane Doe']), venue as string (NOT number), year as 4-digit int)
-- Skills / Technical Skills (list of: name, proficiency_level, years_of_experience as float)
-- Patents / Inventions (list of: title, inventors as LIST OF STRINGS ONLY, patent_no, year, status)
-- Books / Book Authorship (list of: title, authors as LIST OF STRINGS ONLY, publisher, year, isbn)
-- Supervision / Student Mentoring (list of: level, student_name, year)
-
-CRITICAL RULES:
-- Authors MUST be strings ONLY, never objects. Format: ['First Author', 'Second Author']
-- Venue MUST be a string, NEVER a number. Examples: 'IEEE Transactions on Software', 'ACM SIGMOD 2023'
-- Year fields MUST be 4-digit integers (2023), NOT other formats
-- Do NOT include placeholder values like 'N/A', 'TBD', 'Not specified', 'Unknown'
-- Leave null/empty if not found - prefer empty over placeholder
-
-Section Detection Tips:
-- Look for section headings: Education, Experience, Publications, Skills, Patents, Books, Supervision
-- Extract ONLY factual entries with real names, dates, and titles
-- Skip any entry that appears to be an example or placeholder
-
-CV text:
-{cv_text}
-""".strip()
-
-            pass_a = self._extract_pass(pass_a_prompt).candidate
-            logger.info(f"Pass A extracted: {len(pass_a.publications)} publications, {len(pass_a.education)} education, {len(pass_a.experience)} experience")
-
-        except Exception as e:
-            logger.warning(f"Pass A extraction failed: {str(e)}")
-            pass_a = Candidate()
-
-        try:
-            # Pass B: full-text fallback to recover data pass A may miss.
-            pass_b_prompt = f"""
-Extract from CV text: Candidate name, email, summary, education, experience, publications, skills, patents, books, and supervision records.
-This is a RECOVERY pass - capture any entries missed in the first pass.
-
-STRICT FORMATTING:
-- publications[].authors: LIST OF STRINGS ['Author 1', 'Author 2'], NOT [{{'name': 'Author'}}]
-- publications[].venue: STRING like 'IEEE Journal', NEVER integer/number
-- years: 4-digit integers like 2023, NEVER '2023.0' or 'fiscal 2023'
-- job dates: plain text 'Jan 2020' or 'Present', not objects
-- NO placeholder values: skip 'N/A', 'TBD', empty titles
-
-Be thorough - extract ALL mentioned skills, publications, patents, and students.
-But prefer accuracy over volume - skip anything uncertain.
-
-CV text:
-{cv_text}
-""".strip()
-
-            pass_b = self._extract_pass(pass_b_prompt).candidate
-            logger.info(f"Pass B extracted: {len(pass_b.publications)} publications, {len(pass_b.education)} education, {len(pass_b.experience)} experience")
-
-        except Exception as e:
-            logger.warning(f"Pass B extraction failed: {str(e)}")
-            pass_b = Candidate()
-
-        # Merge with quality control
-        merged = self._merge_candidates(pass_a, pass_b)
-        
-        # Clean and deduplicate each section for quality control
-        merged.education = dedupe_education_rows(merged.education)
-        merged.publications = dedupe_and_clean_publications(merged.publications)
-        merged.experience = dedupe_and_clean_experience(merged.experience)
-        merged.patents = dedupe_and_clean_patents(merged.patents)
-        merged.books = dedupe_and_clean_books(merged.books)
-        merged.skills = dedupe_and_clean_skills(merged.skills)
-        
-        logger.info(f"Final output: {len(merged.publications)} publications, {len(merged.education)} education, {len(merged.experience)} experience, {len(merged.patents)} patents, {len(merged.books)} books, {len(merged.skills)} skills")
-        
-        return merged
-
-    def _merge_candidates(self, primary: Candidate, fallback: Candidate) -> Candidate:
-        merged = Candidate(
-            name=primary.name or fallback.name,
-            email=primary.email or fallback.email,
-            summary=primary.summary or fallback.summary,
-            education=[*primary.education, *fallback.education],
-            experience=[*primary.experience, *fallback.experience],
-            publications=[*primary.publications, *fallback.publications],
-            skills=[*primary.skills, *fallback.skills],
-            patents=[*primary.patents, *fallback.patents],
-            books=[*primary.books, *fallback.books],
-            supervision=[*primary.supervision, *fallback.supervision],
+    def extract_section(self, cv_text: str, section: str) -> BaseModel:
+        """Run a focused extraction for one section."""
+        sanitized_text = self._sanitize_cv_text(cv_text)
+        contact_hints = self._extract_contact_hints(sanitized_text)
+        base_user_prompt = (
+            "Extract only what is explicitly present in the sanitized CV text. "
+            "Do not hallucinate or infer unsupported facts. "
+            "Return only the schema for this section.\n\n"
+            f"CV text:\n{sanitized_text}"
         )
 
-        return merged
+        section_key = section.strip().lower()
+        if section_key == "core":
+            model = self._structured_extract(
+                CoreProfileExtraction,
+                system_prompt=(
+                    "You are a senior HR timeline extraction engine. Focus on core profile facts, "
+                    "contact details, education chronology, and work timeline integrity."
+                ),
+                user_prompt=base_user_prompt,
+                max_tokens=2400,
+                timeout=180,
+            ) or CoreProfileExtraction(
+                name=self._guess_name_from_text(sanitized_text),
+                email=contact_hints["email"],
+                phone=contact_hints["phone"],
+                linkedin_url=contact_hints["linkedin_url"],
+                education=[],
+                experience=[],
+            )
+            if self._is_malformed_name(model.name):
+                model.name = self._first_clean_capitalized_phrase(sanitized_text)
+            if not model.email:
+                model.email = contact_hints["email"]
+            if not model.phone:
+                model.phone = contact_hints["phone"]
+            if not model.linkedin_url:
+                model.linkedin_url = contact_hints["linkedin_url"]
+            return model
+
+        if section_key == "academic":
+            return self._structured_extract(
+                AcademicProfileExtraction,
+                system_prompt=(
+                    "You are an academic profile reviewer. Extract publications with citation-quality "
+                    "metadata, author order, and venue details. Also extract supervision and books. "
+                    "Each publication bundle should populate exactly one field: journal or conference. "
+                    "Publications may appear as flattened text from PDF tables. Look for paper titles "
+                    "followed by journal/conference names, volumes/issues, pages, and years. Even when "
+                    "headers and rows are merged, reconstruct publication records conservatively from "
+                    "explicit evidence in the text."
+                ),
+                user_prompt=base_user_prompt,
+                max_tokens=2200,
+                timeout=180,
+            ) or AcademicProfileExtraction(publications=[], supervision=[], books=[])
+
+        if section_key == "skills":
+            return self._structured_extract(
+                SkillsAndIPExtraction,
+                system_prompt=(
+                    "You are a technical evaluator focused on concrete skill extraction and intellectual "
+                    "property. Extract skills with evidence quality and all patent records."
+                ),
+                user_prompt=base_user_prompt,
+                max_tokens=1800,
+                timeout=180,
+            ) or SkillsAndIPExtraction(patents=[], skills=[])
+
+        raise ValueError(f"Unknown extraction section: {section}")
+
+    def extract_cv_data(self, cv_text: str) -> CandidateExtraction:
+        """
+        Logical split extraction in 3 calls to reduce output size and truncation risk.
+        """
+        sanitized_text = self._sanitize_cv_text(cv_text)
+        contact_hints = self._extract_contact_hints(sanitized_text)
+
+        # Explicitly refresh routed client as requested for each extraction run.
+        self.client, self.model = llm_router.get_structured_client()
+
+        core = self.extract_section(sanitized_text, "core")
+        academic = self.extract_section(sanitized_text, "academic")
+        skills_and_ip = self.extract_section(sanitized_text, "skills")
+
+        assembled = self.aggregate_sections(cv_text, core, academic, skills_and_ip)
+
+        logger.info(
+            "Logical split extraction complete | name=%s | edu=%d | exp=%d | journals=%d | conf=%d | supervision=%d | books=%d | patents=%d | skills=%d",
+            assembled.name,
+            len(assembled.education_records),
+            len(assembled.work_experiences),
+            len(assembled.journal_publications),
+            len(assembled.conference_publications),
+            len(assembled.supervision_records),
+            len(assembled.books),
+            len(assembled.patents),
+            len(assembled.skills),
+        )
+
+        return assembled
+
+    def aggregate_sections(
+        self,
+        cv_text: str,
+        core: CoreProfileExtraction,
+        academic: AcademicProfileExtraction,
+        skills_and_ip: SkillsAndIPExtraction,
+    ) -> CandidateExtraction:
+        """Merge focused section payloads back into one candidate object."""
+        sanitized_text = self._sanitize_cv_text(cv_text)
+        contact_hints = self._extract_contact_hints(sanitized_text)
+        contact_overrides = self._extract_contact_info_regex(sanitized_text)
+
+        journal_publications = []
+        conference_publications = []
+        for publication_bundle in academic.publications:
+            if publication_bundle.journal is not None:
+                journal_publications.append(publication_bundle.journal)
+            if publication_bundle.conference is not None:
+                conference_publications.append(publication_bundle.conference)
+
+        extracted_name = core.name or self._guess_name_from_text(sanitized_text)
+        if self._is_malformed_name(extracted_name):
+            logger.warning(
+                "Malformed name detected from shared aggregation: '%s' | Using fallback extraction",
+                extracted_name,
+            )
+            extracted_name = self._first_clean_capitalized_phrase(sanitized_text)
+
+        assembled = CandidateExtraction(
+            name=extracted_name,
+            email=contact_overrides["email"] or contact_hints["email"] or core.email,
+            phone=contact_overrides["phone"] or contact_hints["phone"] or core.phone,
+            linkedin_url=contact_overrides["linkedin_url"] or contact_hints["linkedin_url"] or core.linkedin_url,
+            personal_website=core.personal_website,
+            other_urls=core.other_urls,
+            summary_of_profile=core.summary_of_profile,
+            education_records=core.education,
+            work_experiences=core.experience,
+            journal_publications=journal_publications,
+            conference_publications=conference_publications,
+            supervision_records=academic.supervision,
+            books=academic.books,
+            patents=skills_and_ip.patents,
+            skills=skills_and_ip.skills,
+            career_breaks=[],
+        )
+        assembled.llm_model_name = self.model
+        assembled.llm_provider = self.provider
+        return assembled
+
+    def extract(self, cv_text: str) -> CandidateExtraction:
+        return self.extract_cv_data(cv_text)
 
 
-def extract_candidate_from_text(cv_text: str, **kwargs: Any) -> Candidate:
-    service = CVExtractorService(**kwargs)
-    return service.extract(cv_text)
+def extract_cv_data(cv_text: str, **kwargs: Any) -> CandidateExtraction:
+    service = CVExtractorService()
+    return service.extract_cv_data(cv_text)
+
+
+def extract_candidate_from_text(cv_text: str, **kwargs: Any) -> CandidateExtraction:
+    service = CVExtractorService()
+    return service.extract_cv_data(cv_text)

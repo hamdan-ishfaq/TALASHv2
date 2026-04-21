@@ -1,0 +1,142 @@
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                  TALASH v3 - COPY & PASTE COMMANDS                           ║
+║                                                                               ║
+║  Use these exact commands in your terminal/PowerShell                        ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+
+⭐ STEP 1: START EVERYTHING
+═══════════════════════════════════════════════════════════════════════════════
+
+🖥️  Windows - Run this in PowerShell:
+    docker-compose up -d --build
+
+
+🐧 Linux/Mac - Run this in terminal:
+    docker-compose up -d --build
+
+
+(Wait 10 seconds for services to start)
+
+
+⭐ STEP 2: OPEN THE SWAGGER API DOCS
+═══════════════════════════════════════════════════════════════════════════════
+
+Open this in your browser (copy the URL):
+    http://localhost:8000/docs
+
+You can upload CVs here and test API endpoints interactively!
+
+
+⭐ STEP 3: MONITOR REAL-TIME CV PROCESSING (MOST IMPORTANT!)
+═══════════════════════════════════════════════════════════════════════════════
+
+🔴 COPY & PASTE THIS COMMAND in a NEW terminal/PowerShell window:
+
+    docker-compose logs -f worker --tail=100 | grep -E "(STAGE|TASK|ERROR|SUCCESS|Duration)"
+
+
+Windows (PowerShell) version - if grep doesn't work:
+    docker-compose logs -f worker --tail=100 | findstr /I "STAGE TASK ERROR SUCCESS Duration"
+
+
+This shows you CV processing in REAL-TIME:
+✓ Shows each stage of processing (Load, PDF, LLM, Database)
+✓ Shows timing information
+✓ Shows errors if something fails
+✓ Shows when processing completes successfully
+
+
+⭐ STEP 4: UPLOAD A CV
+═══════════════════════════════════════════════════════════════════════════════
+
+Option A: Using Swagger UI (Easiest)
+   1. Go to http://localhost:8000/docs
+   2. Find the "/upload" endpoint
+   3. Click "Try it out"
+   4. Choose a PDF file
+   5. Click "Execute"
+
+Option B: Using terminal command
+
+   Windows (PowerShell):
+   ────────────────────────────────────────────────────────────────────────────
+   $file = "C:\Path\To\Your\CV.pdf"
+   $form = @{ file = Get-Item $file }
+   Invoke-WebRequest -Uri "http://localhost:8000/upload" -Method Post -Form $form
+
+
+   Linux/Mac (cURL):
+   ────────────────────────────────────────────────────────────────────────────
+   curl -X POST -F "file=@backend/data/cvs/sample.pdf" http://localhost:8000/upload
+
+
+⭐ STEP 5: WATCH THE LOGS WHILE PROCESSING
+═══════════════════════════════════════════════════════════════════════════════
+
+After uploading a CV, you should see LIVE output in the terminal where you
+ran the log command:
+
+Example output:
+─────────────────────────────────────────────────────────────────────────────
+[TASK-START] TaskID: abc123... | CandidateID: 42
+[STAGE-1] LOAD CANDIDATE
+      └─ Duration: 0.12 sec
+[STAGE-2] EXTRACT PDF
+      ├─ Text length: 8,547 characters
+      └─ Duration: 1.34 sec
+[STAGE-3] LLM EXTRACTION
+      ├─ Candidate Name: Ahmed Hassan
+      ├─ Education Records: 3
+      ├─ Work Experiences: 2
+      └─ Duration: 8.67 sec
+[STAGE-4] DB PERSISTENCE
+      ├─ Education: 3 records
+      ├─ Work Experience: 2 records
+      └─ Duration: 0.89 sec
+[TASK-SUCCESS] Total: 11.02 sec
+─────────────────────────────────────────────────────────────────────────────
+
+This is exactly what you want to see! ✅
+
+
+⭐ OPTIONAL: CELERY MONITORING DASHBOARD
+═══════════════════════════════════════════════════════════════════════════════
+
+To see active tasks in a visual dashboard:
+   http://localhost:5555
+
+(This shows task queue status in real-time)
+
+
+⭐ OPTIONAL: CLEAN UP INCOMPLETE RECORDS BEFORE RUNNING
+═══════════════════════════════════════════════════════════════════════════════
+
+Before processing a batch, flush any incomplete records:
+
+Windows (PowerShell):
+   (Invoke-WebRequest -Method POST http://localhost:8000/api/admin/flush-incomplete).Content
+
+
+Linux/Mac (cURL):
+   curl -X POST http://localhost:8000/api/admin/flush-incomplete
+
+
+⭐ STOP ALL SERVICES
+═══════════════════════════════════════════════════════════════════════════════
+
+When done, run:
+   docker-compose down
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                            THAT'S IT!
+                            
+You now have:
+ ✓ Backend API running on http://localhost:8000
+ ✓ Swagger docs at http://localhost:8000/docs
+ ✓ Real-time log monitoring of CV processing
+ ✓ Full database with PostgreSQL
+ ✓ Task queue with Redis & Celery
+ ✓ Flower monitoring dashboard at http://localhost:5555
+═══════════════════════════════════════════════════════════════════════════════

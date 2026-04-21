@@ -18,6 +18,8 @@ def _clean_lines(lines: Iterable[str]) -> str:
     """Normalize whitespace and remove empty lines for stable LLM input."""
     cleaned = []
     for line in lines:
+        # PostgreSQL text columns cannot store NUL bytes.
+        line = line.replace("\x00", "")
         normalized = " ".join(line.split())
         if normalized:
             cleaned.append(normalized)

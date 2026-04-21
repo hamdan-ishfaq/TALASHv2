@@ -15,4 +15,10 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    # Duplicate prevention & resilience
+    task_acks_late=True,           # Ack only after successful completion (prevents resend on crash)
+    task_reject_on_worker_lost=True,  # Reject if worker dies without acknowledgement
+    task_max_retries=2,            # Max 2 retries on transient failures
+    task_time_limit=3600,          # Hard limit: 1 hour per task
+    task_soft_time_limit=3300,     # Soft limit: 55 min (allows graceful shutdown)
 )

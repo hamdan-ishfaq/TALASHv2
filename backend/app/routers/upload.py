@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models.models import Candidate, EducationRecord, WorkExperience, Publication, SupervisionRecord, Book, Patent, Skill, CandidateScore
+from app.models.models import Candidate
 from worker.cv_tasks import process_cv
 
 logger = logging.getLogger(__name__)

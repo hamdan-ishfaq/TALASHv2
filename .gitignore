@@ -59,3 +59,5 @@ dump.rdb
 # OS
 Thumbs.db
 .DS_Store
+frontend/node_modules/
+backend/data/exports/
