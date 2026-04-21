@@ -1,12 +1,13 @@
 """
-Simplified CV processing: Extract PDF -> Send to GPT-4o -> Save to database
-No page-by-page splitting, no Ollama fallback, single unified extraction.
+Simplified CV processing: Extract PDF -> Send to OpenRouter Free Tier -> Save to database
+Sequential extraction (no parallel fan-out) to respect OpenRouter free-tier rate limits.
 
 Features:
 - Comprehensive stage-by-stage logging with timings
 - Detailed error reporting with root cause analysis
 - Resource usage tracking
 - Idempotency checks to prevent duplicate processing
+- Sequential LLM calls with inter-request delays
 """
 from __future__ import annotations
 
@@ -17,14 +18,12 @@ import re
 from datetime import date, datetime
 from typing import Dict, Any
 
-from celery import group
-
 from app.db import SessionLocal
 from app.models.models import (
     Candidate, EducationRecord, WorkExperience, JournalPublication, ConferencePublication, Skill,
     Patent, Book, SupervisionRecord, PublicationAuthor, TopicCluster, CollaborationEdge, ExtractionRun
 )
-from app.services.extractor import CVExtractorService
+from app.services.extractor import CVExtractorService, normalize_nulls
 from app.schemas.extraction import AcademicProfileExtraction, CoreProfileExtraction, SkillsAndIPExtraction
 from app.services.llm_router import llm_router
 from app.services.pdf_parser import extract_pdf_text
@@ -194,6 +193,11 @@ def _format_merged_summary(summary: dict[str, Any], title: str) -> str:
 
 
 def _extract_section_payload(cv_text: str, section: str) -> dict[str, Any]:
+    """Extract a single section and return the payload as a JSON-serializable dict.
+
+    This is called sequentially (not as a Celery subtask) to respect
+    OpenRouter free-tier rate limits.
+    """
     service = CVExtractorService()
     model = service.extract_section(cv_text, section)
     payload = model.model_dump(mode="json")
@@ -203,6 +207,13 @@ def _extract_section_payload(cv_text: str, section: str) -> dict[str, Any]:
     payload["llm_summary"] = llm_router.get_stats_snapshot()
     return payload
 
+
+# ============================================================================
+# NOTE: The old Celery subtasks (extract_core_profile_section, etc.) are
+# preserved below as standalone Celery tasks for backward compatibility and
+# potential future use, but they are NO LONGER called via group() fan-out.
+# The main process_cv task now calls _extract_section_payload() sequentially.
+# ============================================================================
 
 @celery_app.task(name="extract_core_profile_section")
 def extract_core_profile_section(cv_text: str) -> dict[str, Any]:
@@ -251,9 +262,12 @@ def extract_skills_ip_section(cv_text: str) -> dict[str, Any]:
 )
 def process_cv(self, candidate_id: int) -> Dict[str, Any]:
     """
-    Process a CV: Extract PDF text -> Send to LLM -> Save to database.
+    Process a CV: Extract PDF text -> Send to OpenRouter Free Tier -> Save to database.
     
     IDEMPOTENT: Safe to retry. Duplicate calls with same candidate_id will skip if already processed.
+    
+    SEQUENTIAL EXTRACTION: All 3 LLM section calls are made sequentially in-process
+    (NOT via Celery group fan-out) to respect OpenRouter free-tier rate limits.
     
     Args:
         candidate_id: ID of the candidate record in the database
@@ -282,6 +296,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
     logger.info("[TASK-START] ===== CV PROCESSING TASK STARTED =====")
     logger.info("[TASK-START] TaskID: %s | CandidateID: %d | Retry: %d/%d",
                 task_id, candidate_id, self.request.retries, self.max_retries)
+    logger.info("[TASK-START] LLM Provider: OpenRouter Free Tier (openrouter/free)")
     logger.info(STAGE_SEPARATOR)
     
     db = SessionLocal()
@@ -380,22 +395,63 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         logger.info("      └─ Duration: %.2f sec", stage_duration)
 
         # =====================================================================
-        # STAGE 3: LLM EXTRACTION
+        # STAGE 3: LLM EXTRACTION (SEQUENTIAL — OpenRouter Free Tier)
         # =====================================================================
-        log_stage_start(3, "Send to LLM for Structured Extraction", task_id, candidate_id)
+        log_stage_start(3, "Sequential LLM Extraction (OpenRouter Free Tier)", task_id, candidate_id)
         stage_time = time.time()
         llm_router.reset_stats()
         
-        logger.info("[3.1] Launching parallel section extraction tasks...")
+        logger.info("[3.1] Starting SEQUENTIAL section extraction (no parallel fan-out)...")
+        logger.info("[3.1] Strategy: core -> delay -> academic -> delay -> skills")
         try:
-            logger.info("[3.2] Fan-out: core + academic + skills sections")
-            fanout = group(
-                extract_core_profile_section.s(cv_text),
-                extract_academic_profile_section.s(cv_text),
-                extract_skills_ip_section.s(cv_text),
-            ).apply_async()
-            section_payloads = fanout.get(disable_sync_subtasks=False, timeout=1800)
-            core_payload, academic_payload, skills_payload = section_payloads
+            # ---------------------------------------------------------------
+            # SEQUENTIAL extraction: call each section in-process with delays
+            # instead of Celery group() to respect free-tier rate limits.
+            # ---------------------------------------------------------------
+            logger.info("[3.2] Extracting CORE section...")
+            core_payload = _extract_section_payload(cv_text, "core")
+            logger.info(
+                "[3.2] CORE complete | name=%s | edu=%d | exp=%d",
+                core_payload.get("name"),
+                len(core_payload.get("education", []) or []),
+                len(core_payload.get("experience", []) or []),
+            )
+
+            # The inter-request delay is already built into CVExtractorService.extract_cv_data(),
+            # but since we call _extract_section_payload directly here, we add our own delay.
+            from app.services.extractor import OPENROUTER_INTER_REQUEST_DELAY
+            if OPENROUTER_INTER_REQUEST_DELAY > 0:
+                logger.info("[3.2] Waiting %ds before academic section (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
+                time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+
+            logger.info("[3.3] Extracting ACADEMIC section...")
+            academic_payload = _extract_section_payload(cv_text, "academic")
+            logger.info(
+                "[3.3] ACADEMIC complete | publications=%d | supervision=%d | books=%d",
+                len(academic_payload.get("publications", []) or []),
+                len(academic_payload.get("supervision", []) or []),
+                len(academic_payload.get("books", []) or []),
+            )
+
+            if OPENROUTER_INTER_REQUEST_DELAY > 0:
+                logger.info("[3.3] Waiting %ds before skills section (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
+                time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+
+            logger.info("[3.4] Extracting SKILLS & IP section...")
+            skills_payload = _extract_section_payload(cv_text, "skills")
+            logger.info(
+                "[3.4] SKILLS complete | patents=%d | skills=%d",
+                len(skills_payload.get("patents", []) or []),
+                len(skills_payload.get("skills", []) or []),
+            )
+
+            # --- Aggregate section payloads for stats ---
+            section_payloads = [core_payload, academic_payload, skills_payload]
+
+            # --- Normalise null → [] for list fields before Pydantic sees them ---
+            core_payload = normalize_nulls(core_payload)
+            academic_payload = normalize_nulls(academic_payload)
+            skills_payload = normalize_nulls(skills_payload)
             core = CoreProfileExtraction.model_validate(core_payload)
             academic = AcademicProfileExtraction.model_validate(academic_payload)
             skills_and_ip = SkillsAndIPExtraction.model_validate(skills_payload)
@@ -436,7 +492,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         if "llm_summary" not in result:
             result["llm_summary"] = _merge_llm_snapshots([])
         
-        logger.info("[3.3] LLM extraction successful")
+        logger.info("[3.5] LLM extraction successful")
         logger.info("      ├─ Candidate Name: %s", extracted.name)
         logger.info("      ├─ Email: %s", extracted.email or "NOT PROVIDED")
         logger.info("      ├─ Education Records: %d", len(extracted.education_records))
@@ -447,9 +503,9 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         logger.info("      ├─ Skills: %d", len(extracted.skills))
         logger.info("      ├─ Patents: %d", len(extracted.patents))
         logger.info("      ├─ Books: %d", len(extracted.books))
-        logger.info("      └─ Duration: %.2f sec", stage_duration)
+        logger.info("      └─ Duration: %.2f sec (including rate-limit delays)", stage_duration)
         logger.info(
-            "[3.4] Aggregated section summary | core=%d | academic=%d | skills=%d",
+            "[3.6] Aggregated section summary | core=%d | academic=%d | skills=%d",
             len(core.education) + len(core.experience),
             len(academic.publications) + len(academic.supervision) + len(academic.books),
             len(skills_and_ip.patents) + len(skills_and_ip.skills),
@@ -464,6 +520,8 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         # =====================================================================
         # STAGE 3.5: VALIDATION AGGREGATOR (PRE-PERSISTENCE)
         # =====================================================================
+        extraction_flags: list[str] = []
+
         publication_count = len(extracted.journal_publications) + len(extracted.conference_publications)
         if publication_count == 0 and _has_publication_signals(cv_text):
             logger.warning(
@@ -471,6 +529,11 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                 "Triggering academic section re-extraction."
             )
             try:
+                # Rate-limit delay before retry
+                if OPENROUTER_INTER_REQUEST_DELAY > 0:
+                    logger.info("[3.5] Waiting %ds before academic retry (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
+                    time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+
                 retry_service = CVExtractorService()
                 academic_retry = retry_service.extract_section(cv_text, "academic")
                 if isinstance(academic_retry, AcademicProfileExtraction):
@@ -487,14 +550,26 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                     str(retry_error),
                     exc_info=True,
                 )
+            # Check if re-extraction still yielded nothing
+            re_pub_count = len(extracted.journal_publications) + len(extracted.conference_publications)
+            if re_pub_count == 0:
+                extraction_flags.append("ACADEMIC_EXTRACTION_FAILED")
+                logger.warning(
+                    "[3.5-FLAG] ACADEMIC_EXTRACTION_FAILED — publications signals present but "
+                    "extraction yielded 0 after retry. Candidate requires manual review."
+                )
 
         if extracted.email and not _email_matches_candidate_name(extracted.name, extracted.email):
             logger.warning(
-                "[3.5-VALIDATION] Suspicious email/name mismatch detected. Clearing extracted email for manual review. "
+                "[3.5-VALIDATION] Suspicious email/name mismatch detected. "
+                "Preserving raw email for audit and clearing active field. "
                 "name=%s | email=%s",
                 extracted.name,
                 extracted.email,
             )
+            # Preserve original for audit trail (Fix 4)
+            candidate.raw_extracted_email = extracted.email
+            extraction_flags.append("EMAIL_MISMATCH_MANUAL_REVIEW")
             extracted.email = None
 
         try:
@@ -506,8 +581,8 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                 )
             db.add(ExtractionRun(
                 candidate_id=candidate.id,
-                provider=extracted.llm_provider or "litellm-router",
-                model_name=extracted.llm_model_name or "talash-primary",
+                provider=extracted.llm_provider or "openrouter",
+                model_name=extracted.llm_model_name or "openrouter/free",
                 prompt_version="v1-lossless",
                 run_type="primary",
                 status="completed",
@@ -530,8 +605,13 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         candidate.phone = extracted.phone or candidate.phone
         candidate.linkedin_url = extracted.linkedin_url or candidate.linkedin_url
         candidate.personal_website = extracted.personal_website or candidate.personal_website
-        candidate.other_urls = extracted.other_urls or candidate.other_urls
+        candidate.other_urls = ", ".join(extracted.other_urls) if extracted.other_urls else candidate.other_urls
         candidate.summary = extracted.summary_of_profile or None
+        # --- Persist extraction reliability flags ---
+        if extraction_flags:
+            candidate.extraction_flags_json = json.dumps(extraction_flags)
+            candidate.requires_manual_review = True
+            logger.info("[4.1] Extraction flags: %s", extraction_flags)
         try:
             candidate.raw_extraction_json = extracted.model_dump_json()
         except Exception:
@@ -675,7 +755,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                         cluster_name=pub.topic_category,
                         cluster_score=1.0,
                         assigned_by="llm",
-                        model_version=extracted.llm_model_name or "talash-primary",
+                        model_version=extracted.llm_model_name or "openrouter/free",
                     ))
 
                 for author_name in author_names:
@@ -749,7 +829,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                         cluster_name=pub.topic_category,
                         cluster_score=1.0,
                         assigned_by="llm",
-                        model_version=extracted.llm_model_name or "talash-primary",
+                        model_version=extracted.llm_model_name or "openrouter/free",
                     ))
 
                 for author_name in author_names:
@@ -947,5 +1027,3 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
     finally:
         db.close()
         logger.debug("[CLEANUP] Database connection closed")
-
-

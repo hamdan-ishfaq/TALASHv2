@@ -23,6 +23,10 @@ class Candidate(Base):
     analysis_json = Column(Text, nullable=True)
     summary = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="pending")
+    # --- Extraction reliability fields ---
+    extraction_flags_json = Column(Text, nullable=True)       # JSON array e.g. ["ACADEMIC_EXTRACTION_FAILED"]
+    requires_manual_review = Column(Boolean, default=False, nullable=False)
+    raw_extracted_email = Column(String(255), nullable=True)   # Pre-mismatch-clearing email for audit
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 

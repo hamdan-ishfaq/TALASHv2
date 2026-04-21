@@ -61,3 +61,7 @@ Thumbs.db
 .DS_Store
 frontend/node_modules/
 backend/data/exports/
+*.pdf
+*.xlsx
+backend/data/cvs/*
+backend/data/tmp_split/*

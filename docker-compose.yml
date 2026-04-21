@@ -28,7 +28,7 @@ services:
     env_file:
       - .env
     environment:
-      - LLM_PROVIDER=gemini
+      - LLM_PROVIDER=openrouter
       - DATABASE_URL=postgresql+psycopg2://talash:talash@db:5432/talash
       - REDIS_URL=redis://redis:6379/0
     volumes:
@@ -45,11 +45,11 @@ services:
     build:
       context: ./backend
     working_dir: /app
-    command: celery -A app.worker worker --loglevel=info --concurrency=4 --prefetch-multiplier=1
+    command: celery -A app.worker worker --loglevel=info --concurrency=1 --prefetch-multiplier=1
     env_file:
       - .env
     environment:
-      - LLM_PROVIDER=gemini
+      - LLM_PROVIDER=openrouter
       - DATABASE_URL=postgresql+psycopg2://talash:talash@db:5432/talash
       - REDIS_URL=redis://redis:6379/0
     volumes:

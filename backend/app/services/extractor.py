@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, TypeVar
 import logging
+import os
 import re
+import time
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
@@ -17,6 +19,44 @@ from app.services.llm_router import llm_router
 logger = logging.getLogger(__name__)
 
 TModel = TypeVar("TModel", bound=BaseModel)
+
+# ---------------------------------------------------------------------------
+# OpenRouter Free-Tier Rate-Limit Safety
+# ---------------------------------------------------------------------------
+# Configurable delay (seconds) between sequential LLM calls.
+# Default 5s keeps us well within OpenRouter free-tier RPM limits (~10-20 RPM).
+OPENROUTER_INTER_REQUEST_DELAY = int(
+    os.getenv("OPENROUTER_INTER_REQUEST_DELAY", "5")
+)
+
+# ---------------------------------------------------------------------------
+# Pre-validation normaliser – coerces null → [] for known list-typed fields
+# in raw LLM JSON *before* Pydantic sees it.  Belt-and-suspenders with the
+# ``_NullListCoercionMixin`` on the schema classes themselves.
+# ---------------------------------------------------------------------------
+_NULL_TO_LIST_FIELDS = frozenset({
+    "keywords", "author_affiliations", "publications", "supervision",
+    "books", "patents", "skills", "education", "experience",
+    "education_records", "work_experiences", "journal_publications",
+    "conference_publications", "supervision_records", "career_breaks"
+})
+
+
+def normalize_nulls(obj):
+    """Recursively coerce ``null`` → ``[]`` for known list fields.
+
+    Call this on the raw dict / JSON-parsed output from the LLM **before**
+    passing it into ``model_validate()``.  This catches edge-cases where the
+    model returns explicit ``null`` values for list-typed keys.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: ([] if v is None and k in _NULL_TO_LIST_FIELDS else normalize_nulls(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [normalize_nulls(i) for i in obj]
+    return obj
 
 
 EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -37,7 +77,7 @@ STRUCTURAL_ARTIFACT_PATTERN = re.compile(
 class CVExtractorService:
     def __init__(self):
         self.client, self.model = llm_router.get_structured_client()
-        self.provider = getattr(llm_router, "provider", "litellm-router")
+        self.provider = getattr(llm_router, "provider", "openrouter")
         logger.info(
             "CVExtractorService initialized | Model: %s | Provider: %s",
             self.model,
@@ -175,8 +215,25 @@ class CVExtractorService:
         max_tokens: int,
         timeout: int,
     ) -> TModel | None:
+        """Perform a structured extraction call via instructor + OpenRouter.
+
+        Records attempt/success/failure metrics on the global llm_router
+        for observability.
+        """
+        request_id = llm_router.record_attempt()
+        started_at = time.time()
+
+        logger.info(
+            "[LLM-REQUEST #%d] model=%s | schema=%s | max_tokens=%d | timeout=%ds",
+            request_id,
+            self.model,
+            response_model.__name__,
+            max_tokens,
+            timeout,
+        )
+
         try:
-            return self.client.chat.completions.create(
+            result = self.client.chat.completions.create(
                 model=self.model,
                 response_model=response_model,
                 messages=[
@@ -188,12 +245,32 @@ class CVExtractorService:
                 max_tokens=max_tokens,
                 timeout=timeout,
             )
-        except Exception as exc:
-            logger.error(
-                "Structured extraction failed for %s on %s: %s",
+            duration = time.time() - started_at
+            llm_router.record_success(
+                request_id,
+                duration,
+                response_preview=f"OK: {response_model.__name__}",
+            )
+            logger.info(
+                "[LLM-RESPONSE #%d] model=%s | schema=%s | duration=%.2fs | status=SUCCESS",
+                request_id,
+                self.model,
                 response_model.__name__,
-                self.provider,
-                str(exc),
+                duration,
+            )
+            return result
+
+        except Exception as exc:
+            duration = time.time() - started_at
+            error_text = f"{type(exc).__name__}: {exc}"
+            llm_router.record_failure(request_id, duration, error_text)
+            logger.error(
+                "[LLM-ERROR #%d] model=%s | schema=%s | duration=%.2fs | error=%s",
+                request_id,
+                self.model,
+                response_model.__name__,
+                duration,
+                error_text,
             )
             return None
 
@@ -214,11 +291,13 @@ class CVExtractorService:
                 CoreProfileExtraction,
                 system_prompt=(
                     "You are a senior HR timeline extraction engine. Focus on core profile facts, "
-                    "contact details, education chronology, and work timeline integrity."
+                    "contact details, education chronology, and work timeline integrity. "
+                    "CRITICAL: For ALL list-type fields (education, experience) you MUST "
+                    "return an empty array [] — NEVER return null or None for any list field."
                 ),
                 user_prompt=base_user_prompt,
-                max_tokens=2400,
-                timeout=180,
+                max_tokens=4096,
+                timeout=300,
             ) or CoreProfileExtraction(
                 name=self._guess_name_from_text(sanitized_text),
                 email=contact_hints["email"],
@@ -247,11 +326,14 @@ class CVExtractorService:
                     "Publications may appear as flattened text from PDF tables. Look for paper titles "
                     "followed by journal/conference names, volumes/issues, pages, and years. Even when "
                     "headers and rows are merged, reconstruct publication records conservatively from "
-                    "explicit evidence in the text."
+                    "explicit evidence in the text.\n\n"
+                    "CRITICAL: For ALL list-type fields (keywords, author_affiliations, publications, "
+                    "supervision, books) you MUST return an empty array [] — NEVER return null or None "
+                    "for any list field."
                 ),
                 user_prompt=base_user_prompt,
-                max_tokens=2200,
-                timeout=180,
+                max_tokens=4096,
+                timeout=300,
             ) or AcademicProfileExtraction(publications=[], supervision=[], books=[])
 
         if section_key == "skills":
@@ -259,33 +341,70 @@ class CVExtractorService:
                 SkillsAndIPExtraction,
                 system_prompt=(
                     "You are a technical evaluator focused on concrete skill extraction and intellectual "
-                    "property. Extract skills with evidence quality and all patent records."
+                    "property. Extract skills with evidence quality and all patent records.\n\n"
+                    "CRITICAL: For ALL list-type fields (patents, skills) you MUST return an empty "
+                    "array [] — NEVER return null or None for any list field."
                 ),
                 user_prompt=base_user_prompt,
-                max_tokens=1800,
-                timeout=180,
+                max_tokens=3072,
+                timeout=300,
             ) or SkillsAndIPExtraction(patents=[], skills=[])
 
         raise ValueError(f"Unknown extraction section: {section}")
 
     def extract_cv_data(self, cv_text: str) -> CandidateExtraction:
         """
-        Logical split extraction in 3 calls to reduce output size and truncation risk.
+        Sequential 3-call extraction with inter-request delays for OpenRouter
+        free-tier rate-limit safety.
+
+        Strategy:
+          1. Core profile (contact + education + experience)
+          2. Academic profile (publications + supervision + books)
+          3. Skills & IP (skills + patents)
+
+        Each call is separated by OPENROUTER_INTER_REQUEST_DELAY seconds.
         """
         sanitized_text = self._sanitize_cv_text(cv_text)
         contact_hints = self._extract_contact_hints(sanitized_text)
 
-        # Explicitly refresh routed client as requested for each extraction run.
+        # Explicitly refresh routed client for each extraction run.
         self.client, self.model = llm_router.get_structured_client()
 
+        # --- Sequential extraction with rate-limit delays ---
+        logger.info(
+            "[EXTRACTOR] Starting sequential 3-section extraction | delay=%ds",
+            OPENROUTER_INTER_REQUEST_DELAY,
+        )
+
+        # Section 1: Core
         core = self.extract_section(sanitized_text, "core")
+
+        # Rate-limit delay before next call
+        if OPENROUTER_INTER_REQUEST_DELAY > 0:
+            logger.info(
+                "[EXTRACTOR] Waiting %ds before academic section (rate-limit safety)...",
+                OPENROUTER_INTER_REQUEST_DELAY,
+            )
+            time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+
+        # Section 2: Academic
         academic = self.extract_section(sanitized_text, "academic")
+
+        # Rate-limit delay before next call
+        if OPENROUTER_INTER_REQUEST_DELAY > 0:
+            logger.info(
+                "[EXTRACTOR] Waiting %ds before skills section (rate-limit safety)...",
+                OPENROUTER_INTER_REQUEST_DELAY,
+            )
+            time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+
+        # Section 3: Skills & IP
         skills_and_ip = self.extract_section(sanitized_text, "skills")
 
         assembled = self.aggregate_sections(cv_text, core, academic, skills_and_ip)
 
         logger.info(
-            "Logical split extraction complete | name=%s | edu=%d | exp=%d | journals=%d | conf=%d | supervision=%d | books=%d | patents=%d | skills=%d",
+            "Sequential extraction complete | name=%s | edu=%d | exp=%d | journals=%d | conf=%d | supervision=%d | books=%d | patents=%d | skills=%d",
             assembled.name,
             len(assembled.education_records),
             len(assembled.work_experiences),

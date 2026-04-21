@@ -1,7 +1,102 @@
 from enum import Enum
-from typing import List, Optional
-from pydantic import BaseModel, Field
-from datetime import date
+from typing import List, Optional, Union, get_origin, get_args
+from pydantic import BaseModel, Field, model_validator, field_validator
+from datetime import date, datetime
+
+
+class _NullListCoercionMixin(BaseModel):
+    """Mixin that coerces explicit null values to empty lists for list-typed fields.
+
+    When LLMs return ``"keywords": null`` instead of ``"keywords": []``, Pydantic
+    rejects the payload because ``default_factory=list`` only applies when the key is
+    *absent*.  This ``model_validator(mode="before")`` intercepts the raw dict and
+    replaces ``None`` with ``[]`` for every field whose annotation is ``List[...]``.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_null_lists(cls, data):
+        if not isinstance(data, dict):
+            return data
+        for field_name, field_info in cls.model_fields.items():
+            if field_name in data and data[field_name] is None:
+                annotation = field_info.annotation
+                # Handle Optional[List[...]] → unwrap Optional to find List
+                origin = get_origin(annotation)
+                if origin is list:
+                    data[field_name] = []
+                    continue
+                # For Union types (Optional[List[...]]), check args
+                if origin is Union:
+                    args = get_args(annotation)
+                    for arg in args:
+                        if get_origin(arg) is list:
+                            data[field_name] = []
+                            break
+                else:
+                    args = getattr(annotation, "__args__", None)
+                    if args:
+                        for arg in args:
+                            if get_origin(arg) is list:
+                                data[field_name] = []
+                                break
+        return data
+
+
+class _DateCoercionMixin(BaseModel):
+    """Mixin that gracefully coerces date-like strings to ``datetime.date``.
+
+    Free-tier LLMs frequently return dates as plain strings like ``"2020-01-15"``
+    or ``"2020"`` instead of proper date objects.  This validator intercepts known
+    date fields and converts them before Pydantic's strict type checker rejects them.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_date_strings(cls, data):
+        if not isinstance(data, dict):
+            return data
+        date_fields = []
+        for field_name, field_info in cls.model_fields.items():
+            annotation = field_info.annotation
+            # Check if annotation is date, Optional[date], etc.
+            if annotation is date:
+                date_fields.append(field_name)
+            else:
+                origin = get_origin(annotation)
+                if origin is Union:
+                    args = get_args(annotation)
+                    if date in args:
+                        date_fields.append(field_name)
+                else:
+                    args = getattr(annotation, "__args__", None)
+                    if args and date in args:
+                        date_fields.append(field_name)
+
+        for field_name in date_fields:
+            value = data.get(field_name)
+            if value is None or isinstance(value, date):
+                continue
+            if isinstance(value, str):
+                data[field_name] = _parse_date_string(value)
+        return data
+
+
+def _parse_date_string(value: str) -> date | None:
+    """Parse a date string from various LLM output formats."""
+    if not value or not value.strip():
+        return None
+    value = value.strip()
+    formats = ["%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%Y", "%Y", "%b %Y", "%B %Y"]
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if fmt in {"%Y", "%m/%Y", "%b %Y", "%B %Y"}:
+                return date(parsed.year, parsed.month, 1)
+            return parsed.date()
+        except ValueError:
+            continue
+    return None
 
 
 class EducationalStage(str, Enum):
@@ -89,7 +184,7 @@ class EducationRecordExtraction(BaseModel):
     confidence_score: Optional[float] = Field(None, description="Model confidence for this extracted record, 0.0 to 1.0.")
 
 
-class JournalPublicationExtraction(BaseModel):
+class JournalPublicationExtraction(_NullListCoercionMixin):
     title: str = Field(..., description="Complete title of the journal publication.")
     authors: Optional[str] = Field(None, description="Comma-separated list of ALL authors exactly as they appear on the paper, in order. This is crucial for co-author network analysis.")
     journal_name: Optional[str] = Field(None, description="The complete and exact name of the journal (e.g., 'IEEE Transactions on Pattern Analysis and Machine Intelligence').")
@@ -114,7 +209,7 @@ class JournalPublicationExtraction(BaseModel):
     confidence_score: Optional[float] = Field(None, description="Model confidence for this extracted record, 0.0 to 1.0.")
 
 
-class ConferencePublicationExtraction(BaseModel):
+class ConferencePublicationExtraction(_NullListCoercionMixin):
     title: str = Field(..., description="Complete title of the conference paper.")
     authors: Optional[str] = Field(None, description="Comma-separated list of ALL authors in order, exactly as they appear on the paper. This is crucial for co-author network analysis.")
     conference_name: Optional[str] = Field(None, description="The complete and exact name of the conference (e.g., 'IEEE/CVF Conference on Computer Vision and Pattern Recognition').")
@@ -165,7 +260,7 @@ class BookExtraction(BaseModel):
     confidence_score: Optional[float] = Field(None, description="Model confidence for this extracted record, 0.0 to 1.0.")
 
 
-class PatentExtraction(BaseModel):
+class PatentExtraction(_DateCoercionMixin):
     title: str = Field(..., description="Official title of the patent as listed on the CV.")
     inventors: Optional[str] = Field(None, description="Complete list of ALL inventors/innovators in order, exactly as they appear on the patent documentation. Crucial for inventor network analysis.")
     patent_no: Optional[str] = Field(None, description="The official patent number (e.g., 'US12345678', 'IN201721005678'). Extract exactly as written.")
@@ -209,13 +304,13 @@ class SkillExtraction(BaseModel):
     confidence_score: Optional[float] = Field(None, description="Model confidence for this extracted record, 0.0 to 1.0.")
 
 
-class CoreProfileExtraction(BaseModel):
+class CoreProfileExtraction(_NullListCoercionMixin):
     name: str = Field(..., description="Full name of the candidate as stated on the CV.")
     email: Optional[str] = Field(None, description="Email address of the candidate.")
     phone: Optional[str] = Field(None, description="Phone number of the candidate (any format).")
     linkedin_url: Optional[str] = Field(None, description="LinkedIn profile URL if provided on the CV.")
     personal_website: Optional[str] = Field(None, description="Personal website or portfolio URL if provided on the CV.")
-    other_urls: Optional[str] = Field(None, description="Comma-separated list of other professional URLs if provided.")
+    other_urls: Optional[List[str]] = Field(default_factory=list, description="List of other professional URLs if provided.")
     summary_of_profile: Optional[str] = Field(None, description="Professional summary of the candidate profile.")
     education: List[EducationRecordExtraction] = Field(default_factory=list, description="Extracted education records.")
     experience: List[WorkExperienceExtraction] = Field(default_factory=list, description="Extracted work experience records.")
@@ -226,7 +321,7 @@ class PublicationExtractionBundle(BaseModel):
     conference: Optional[ConferencePublicationExtraction] = Field(None, description="Populate when the publication is a conference paper.")
 
 
-class AcademicProfileExtraction(BaseModel):
+class AcademicProfileExtraction(_NullListCoercionMixin):
     publications: List[PublicationExtractionBundle] = Field(
         default_factory=list,
         description=(
@@ -239,18 +334,18 @@ class AcademicProfileExtraction(BaseModel):
     books: List[BookExtraction] = Field(default_factory=list, description="Books authored or co-authored by the candidate.")
 
 
-class SkillsAndIPExtraction(BaseModel):
+class SkillsAndIPExtraction(_NullListCoercionMixin):
     patents: List[PatentExtraction] = Field(default_factory=list, description="Filed/granted patent records.")
     skills: List[SkillExtraction] = Field(default_factory=list, description="Extracted skill records.")
 
 
-class CandidateExtraction(BaseModel):
+class CandidateExtraction(_NullListCoercionMixin):
     name: str = Field(..., description="Full name of the candidate as stated on the CV.")
     email: Optional[str] = Field(None, description="Email address of the candidate. CRUCIAL for Section 4 (drafting missing-info emails). Extract exactly as written on the CV.")
     phone: Optional[str] = Field(None, description="Phone number of the candidate (any format). Extract exactly as written, including country code if present.")
     linkedin_url: Optional[str] = Field(None, description="LinkedIn profile URL if provided on the CV.")
     personal_website: Optional[str] = Field(None, description="Personal website or portfolio URL if provided on the CV.")
-    other_urls: Optional[str] = Field(None, description="Comma-separated list of other professional URLs (GitHub, ResearchGate, Google Scholar, etc.) if provided.")
+    other_urls: Optional[List[str]] = Field(default_factory=list, description="List of other professional URLs (GitHub, ResearchGate, Google Scholar, etc.) if provided.")
     summary_of_profile: Optional[str] = Field(None, description="A professional, synthesized 2-3 paragraph executive summary of the candidate's overall profile, key strengths, research focus, and experience level. Focus on what makes them unique.")
     education_records: List[EducationRecordExtraction] = Field(default_factory=list, description="Extracted records of formal education progression from earliest to latest. Include all degrees listed.")
     work_experiences: List[WorkExperienceExtraction] = Field(default_factory=list, description="Extracted professional work experience history in reverse chronological order (most recent first). Include all positions listed.")
@@ -262,5 +357,5 @@ class CandidateExtraction(BaseModel):
     skills: List[SkillExtraction] = Field(default_factory=list, description="Skills listed by the candidate along with analytical validation against their work experience and research publications.")
     career_breaks: List[CareerBreak] = Field(default_factory=list, description="Explicitly stated career breaks or gaps with explanations (e.g., Sabbatical, Maternity Leave, Medical Leave). CRITICAL for Section 3.8 gap justification analysis to distinguish between explained gaps and unexplained employment gaps.")
     raw_llm_response: Optional[str] = Field(None, description="Optional raw model response preserved for auditability.")
-    llm_model_name: Optional[str] = Field(None, description="Model used for extraction (e.g., 'talash-primary', 'groq/llama-3.3-70b-versatile')")
-    llm_provider: Optional[str] = Field(None, description="Provider name (e.g., 'litellm-router')")
+    llm_model_name: Optional[str] = Field(None, description="Model used for extraction (e.g., 'openrouter/free').")
+    llm_provider: Optional[str] = Field(None, description="Provider name (e.g., 'openrouter').")

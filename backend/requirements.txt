@@ -5,6 +5,7 @@ psycopg2-binary
 celery
 flower
 redis
+openai
 instructor
 litellm
 ollama

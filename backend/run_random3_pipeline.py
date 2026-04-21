@@ -57,8 +57,13 @@ print('STEP 2: sampling until 3 completed CVs...')
 db = SessionLocal()
 try:
     for p in pool_files:
-        if len(completed_ids) >= 3:
+        if len(completed_ids) >= 1:
             break
+
+        # Rate limit: Wait 10 seconds before starting next CV attempt
+        if attempted_ids:
+            print("  rate limit: waiting 10s...")
+            time.sleep(10)
 
         resp = queue_cv_from_path(str(p))
         queue_status = resp.get('status')
@@ -91,9 +96,9 @@ try:
         else:
             print(f'  not completed: candidate_id={cid} status={final_state}')
 
-    if len(completed_ids) < 3:
+    if len(completed_ids) < 1:
         raise SystemExit(
-            f'Could not complete 3 CVs. completed={len(completed_ids)} attempted={attempted_ids}'
+            f'Could not complete 1 CV. completed={len(completed_ids)} attempted={attempted_ids}'
         )
 
     print('STEP 4: generating XLSX export...')
