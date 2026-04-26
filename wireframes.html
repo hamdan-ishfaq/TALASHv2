@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TALASH Milestone 1 Wireframes</title>
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        .wf{font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:11px;color:#333;line-height:1.4}
+        .figma-bar{background:#2c2c2c;padding:8px 16px;display:flex;align-items:center;justify-content:space-between}
+        .figma-bar-left{display:flex;align-items:center;gap:10px}
+        .figma-icon{width:16px;height:16px;background:#555;border-radius:2px;flex-shrink:0}
+        .figma-title{font-size:12px;color:#ccc;font-weight:500}
+        .figma-badge{border:1px solid #555;color:#888;font-size:10px;padding:2px 7px;border-radius:2px}
+        .figma-tool{width:22px;height:22px;border:1px solid #555;display:flex;align-items:center;justify-content:center;cursor:default}
+        .figma-tool svg{width:10px;height:10px;stroke:#aaa;fill:none;stroke-width:1.5}
+        .canvas{background:#dedede;padding:32px 20px 48px}
+        .frame-wrap{margin-bottom:48px}
+        .frame-name{font-size:11px;color:#0d99ff;margin-bottom:6px;font-weight:500;letter-spacing:.01em}
+        .frame{background:#fff;width:100%}
+        .wf-nav{height:36px;background:#f0f0f0;border-bottom:1px solid #c8c8c8;display:flex;align-items:center;padding:0 12px;gap:8px;flex-shrink:0}
+        .wf-nav-logo{width:20px;height:20px;background:#c8c8c8;border-radius:2px;flex-shrink:0}
+        .wf-nav-pill{height:18px;background:#dcdcdc;border-radius:2px}
+        .wf-nav-avatar{width:20px;height:20px;border-radius:50%;background:#c0c0c0;margin-left:auto;flex-shrink:0}
+        .body{padding:14px}
+        .two-col{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px}
+        .sec-head{font-size:9px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.08em;margin-bottom:9px;padding-bottom:4px;border-bottom:1px solid #e0e0e0}
+        .wf-label{font-size:9px;color:#888;margin-bottom:3px;display:block}
+        .wf-input{border:1px solid #aaa;background:#fff;height:27px;width:100%;margin-bottom:8px;display:flex;align-items:center;padding:0 8px;color:#aaa;font-size:10px}
+        .wf-ta{border:1px solid #aaa;background:#fff;width:100%;padding:8px;margin-bottom:8px}
+        .txt-block{display:flex;flex-direction:column;gap:4px}
+        .txt-ln{height:7px;background:#dedede;border-radius:1px}
+        .wf-btn{border:1px solid #666;background:#e0e0e0;text-align:center;padding:8px;font-size:10px;font-weight:700;color:#333;margin-bottom:8px;width:100%;cursor:default}
+        .wf-btn-sm{border:1px solid #888;background:#ebebeb;padding:4px 10px;font-size:9px;color:#444;cursor:default;display:inline-block}
+        .chips{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}
+        .chip{border:1px solid #b0b0b0;background:#f0f0f0;padding:3px 8px;font-size:9px;color:#555}
+        .chip-active{border-color:#666;background:#e0e0e0;color:#222}
+        .card{border:1px solid #c8c8c8;background:#fafafa;padding:9px;margin-bottom:8px}
+        .status-bar{display:flex;align-items:center;gap:6px;border:1px solid #b8b8b8;background:#f5f5f5;padding:7px 10px;font-size:10px;color:#555;margin-bottom:8px}
+        .dot{width:7px;height:7px;border-radius:50%;border:1px solid #888;background:#c0c0c0;flex-shrink:0}
+        .dot-solid{background:#777}
+        .dropzone{border:2px dashed #aaa;background:#fafafa;padding:18px 12px;text-align:center;margin-bottom:8px;display:flex;flex-direction:column;align-items:center;gap:6px}
+        .drop-icon{width:32px;height:32px;border:1px solid #bbb;background:#e8e8e8;display:flex;align-items:center;justify-content:center}
+        .drop-icon svg{width:16px;height:16px;stroke:#999;fill:none;stroke-width:1.5}
+        .q-row{display:flex;align-items:center;gap:7px;padding:5px 8px;border:1px solid #ddd;background:#fafafa;margin-bottom:4px;font-size:9px;color:#555}
+        .q-prog{flex:1;height:3px;background:#e8e8e8;border:1px solid #d0d0d0}
+        .q-fill{height:100%;background:#aaa}
+        .badge{border:1px solid #bbb;background:#ebebeb;padding:1px 6px;font-size:9px;color:#555}
+        .m-card{border:1px solid #c8c8c8;background:#f5f5f5;padding:10px}
+        .m-num{font-size:26px;font-weight:700;color:#333;line-height:1.1}
+        .m-sub{font-size:8px;color:#888;margin-top:3px}
+        .m-lbl{font-size:9px;color:#666;margin-bottom:3px}
+        .xbox{border:1px solid #c0c0c0;background:#f5f5f5;position:relative;overflow:hidden;margin-bottom:8px}
+        .xsvg{position:absolute;top:0;left:0;width:100%;height:100%}
+        .xbox-label{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:9px;color:#aaa;text-align:center;white-space:nowrap}
+        .filter-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}
+        .f-search{flex:1;border:1px solid #aaa;height:26px;background:#fff;display:flex;align-items:center;padding:0 7px;gap:5px;font-size:10px;color:#aaa;min-width:0}
+        .f-sel{border:1px solid #aaa;height:26px;background:#fff;padding:0 6px;font-size:9px;color:#666;display:flex;align-items:center;gap:3px;white-space:nowrap}
+        .f-sel::after{content:'▾';color:#aaa;font-size:8px;margin-left:2px}
+        .tbl{width:100%;border-collapse:collapse;font-size:9px;table-layout:fixed}
+        .tbl th{border:1px solid #ccc;background:#ebebeb;padding:6px 7px;text-align:left;font-weight:700;font-size:9px;color:#444;white-space:nowrap}
+        .tbl td{border:1px solid #ddd;padding:6px 7px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .tbl tr:nth-child(even) td{background:#fafafa}
+        .anno-box{border:1px dashed #bbb;background:#fafafa;padding:7px 9px;font-size:9px;color:#777;line-height:1.6;margin-top:8px}
+        .wf-page-label{font-size:9px;color:#888;font-style:italic;text-align:center;padding:4px 0;border-bottom:1px solid #e8e8e8;margin-bottom:10px}
+        .sp{margin-bottom:8px}
+        .divider{border-top:1px solid #e0e0e0;margin:9px 0}
+    </style>
+</head>
+<body class="wf">
+    <div class="figma-bar">
+        <div class="figma-bar-left">
+            <div class="figma-icon"></div>
+            <span class="figma-title">TALASH — Milestone 1 Wireframes</span>
+            <span class="figma-badge">3 frames</span>
+        </div>
+        <div style="display:flex;gap:6px">
+            <div class="figma-tool"><svg viewBox="0 0 10 10"><path d="M2 5h6M5 2v6"/></svg></div>
+            <div class="figma-tool"><svg viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" rx="1"/></svg></div>
+        </div>
+        <span style="font-size:10px;color:#777">100%</span>
+    </div>
+
+    <div class="canvas">
+
+        <!-- FRAME 1: CV Upload -->
+        <div class="frame-wrap">
+            <div class="frame-name">Frame 1 — CV Upload & Ingestion Setup</div>
+            <div class="frame">
+                <div class="wf-nav">
+                    <div class="wf-nav-logo"></div>
+                    <div class="wf-nav-pill" style="width:55px"></div>
+                    <div class="wf-nav-pill" style="width:70px"></div>
+                    <div class="wf-nav-pill" style="width:48px"></div>
+                    <div class="wf-nav-avatar"></div>
+                </div>
+                <div class="body">
+                    <div class="wf-page-label">Frame 1 of 3 — CV Upload & Ingestion Setup</div>
+                    <div class="two-col">
+                        <div>
+                            <div class="sec-head">Left Panel — Job Configuration</div>
+                            <span class="wf-label">Target Role</span>
+                            <div class="wf-input">Associate Prof — Machine Learning</div>
+                            
+                            <span class="wf-label">Role Skills Required</span>
+                            <div class="chips">
+                                <span class="chip chip-active">Machine Learning</span>
+                                <span class="chip chip-active">Deep Learning</span>
+                                <span class="chip chip-active">PhD Supervision</span>
+                                <span class="chip">Research Publications</span>
+                                <span class="chip">Grant Writing</span>
+                            </div>
+
+                            <span class="wf-label">System Status</span>
+                            <div class="status-bar">
+                                <div class="dot dot-solid"></div>
+                                <span style="font-weight:600">Ready to ingest</span>
+                            </div>
+
+                            <div class="wf-btn">[ Initialize System ]</div>
+                        </div>
+
+                        <div>
+                            <div class="sec-head">Right Panel — CV Upload & Queue</div>
+                            <div class="dropzone">
+                                <div class="drop-icon">
+                                    <svg viewBox="0 0 16 16"><polyline points="8 2 8 10"/><polyline points="5 7 8 10 11 7"/><rect x="2" y="11" width="12" height="3" rx="1"/></svg>
+                                </div>
+                                <div style="font-size:10px;font-weight:600;color:#555">Drag &amp; drop CVs here</div>
+                                <div style="font-size:9px;color:#999">.pdf · .docx</div>
+                                <div class="wf-btn-sm">Browse files</div>
+                            </div>
+
+                            <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+                                <span class="wf-label" style="margin-bottom:0">Processing Queue</span>
+                                <span style="font-size:9px;color:#888">2 / 5 complete</span>
+                            </div>
+
+                            <div class="q-row">
+                                <span style="flex:1;font-size:9px">candidate_001.pdf</span>
+                                <div class="q-prog"><div class="q-fill" style="width:100%;background:#666"></div></div>
+                                <span class="badge">✓ Done</span>
+                            </div>
+                            <div class="q-row">
+                                <span style="flex:1;font-size:9px">candidate_002.pdf</span>
+                                <div class="q-prog"><div class="q-fill" style="width:60%"></div></div>
+                                <span class="badge">Extracting…</span>
+                            </div>
+                            <div class="q-row">
+                                <span style="flex:1;font-size:9px;color:#aaa">candidate_003.pdf</span>
+                                <div class="q-prog"></div>
+                                <span class="badge">Queued</span>
+                            </div>
+                            <div class="q-row" style="opacity:.5">
+                                <span style="flex:1;font-size:9px;color:#bbb">candidate_004.pdf</span>
+                                <div class="q-prog"></div>
+                                <span class="badge">Queued</span>
+                            </div>
+                            <div class="q-row" style="opacity:.5">
+                                <span style="flex:1;font-size:9px;color:#bbb">candidate_005.pdf</span>
+                                <div class="q-prog"></div>
+                                <span class="badge">Queued</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="anno-box">Milestone 1 scope: Basic CV upload, folder monitoring setup, and initial extraction pipeline. Full multi-candidate processing and advanced analysis deferred to Milestone 2–3.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FRAME 2: Extraction Results -->
+        <div class="frame-wrap">
+            <div class="frame-name">Frame 2 — Extraction Results & Candidate Summary</div>
+            <div class="frame">
+                <div class="wf-nav">
+                    <div class="wf-nav-logo"></div>
+                    <div class="wf-nav-pill" style="width:55px"></div>
+                    <div class="wf-nav-pill" style="width:70px"></div>
+                    <div class="wf-nav-pill" style="width:48px"></div>
+                    <div class="wf-nav-avatar"></div>
+                </div>
+                <div class="body">
+                    <div class="wf-page-label">Frame 2 of 3 — Extraction Results &amp; Candidate Summary</div>
+
+                    <div class="three-col sp">
+                        <div class="m-card">
+                            <div class="m-lbl">Candidate Name</div>
+                            <div class="m-num" style="font-size:16px">Dr. Ayesha Khan</div>
+                            <div class="m-sub">File: candidate_001.pdf · Parsed</div>
+                        </div>
+                        <div class="m-card">
+                            <div class="m-lbl">Education Records</div>
+                            <div class="m-num">3</div>
+                            <div class="m-sub">BS / MS / PhD extracted</div>
+                        </div>
+                        <div class="m-card">
+                            <div class="m-lbl">Data Extraction</div>
+                            <div class="m-num">7</div>
+                            <div class="m-sub">Field groups completed</div>
+                        </div>
+                    </div>
+
+                    <div class="sec-head">Extracted Data Summary</div>
+
+                    <div class="two-col sp">
+                        <div>
+                            <div class="card">
+                                <div class="wf-label" style="margin-bottom:6px">Personal Information</div>
+                                <div style="font-size:9px;line-height:1.8;color:#555">
+                                    <div><strong>Name:</strong> Dr. Ayesha Khan</div>
+                                    <div><strong>Email:</strong> ayesha.khan@lums.edu.pk</div>
+                                    <div><strong>Institution:</strong> LUMS CS Dept.</div>
+                                </div>
+                            </div>
+
+                            <div class="card">
+                                <div class="wf-label" style="margin-bottom:6px">Education</div>
+                                <div style="font-size:8px;line-height:1.8;color:#555">
+                                    <div>PhD — Machine Learning, LUMS (2020)</div>
+                                    <div>MS — Machine Learning, FAST-NUCES (2016)</div>
+                                    <div>BE — Computer Engineering, UET (2013)</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div>
+                            <div class="card">
+                                <div class="wf-label" style="margin-bottom:6px">Experience</div>
+                                <div style="font-size:8px;line-height:1.8;color:#555">
+                                    <div><strong>2020–present:</strong> Assistant Professor, LUMS</div>
+                                    <div><strong>2016–2020:</strong> PhD Research Associate</div>
+                                    <div><strong>2013–2014:</strong> Junior Software Engineer</div>
+                                </div>
+                            </div>
+
+                            <div class="card">
+                                <div class="wf-label" style="margin-bottom:6px">Quick Stats</div>
+                                <div style="font-size:8px;line-height:1.8;color:#555">
+                                    <div><strong>Publications:</strong> 38 papers detected</div>
+                                    <div><strong>Skills:</strong> 12 skills listed</div>
+                                    <div><strong>Supervision:</strong> 6 PhD students</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="sec-head">Structured Data Tables (Expandable)</div>
+
+                    <div style="margin-bottom:12px">
+                        <div class="wf-label">Education Records (3 rows)</div>
+                        <table class="tbl">
+                            <thead>
+                                <tr>
+                                    <th style="width:20%">Degree</th>
+                                    <th style="width:25%">Institution</th>
+                                    <th style="width:15%">Year</th>
+                                    <th style="width:15%">CGPA</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>PhD (ML)</td><td>LUMS</td><td>2020</td><td>3.9/4.0</td>
+                                </tr>
+                                <tr>
+                                    <td>MS (ML)</td><td>FAST-NUCES</td><td>2016</td><td>3.7/4.0</td>
+                                </tr>
+                                <tr>
+                                    <td>BE</td><td>UET Lahore</td><td>2013</td><td>3.6/4.0</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div style="margin-bottom:12px">
+                        <div class="wf-label">Experience Records (3 rows)</div>
+                        <table class="tbl">
+                            <thead>
+                                <tr>
+                                    <th style="width:20%">Job Title</th>
+                                    <th style="width:25%">Organization</th>
+                                    <th style="width:30%">Duration</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>Assistant Professor</td><td>LUMS CS Dept.</td><td>2020 – present</td>
+                                </tr>
+                                <tr>
+                                    <td>PhD Research Assoc.</td><td>LUMS AI Lab</td><td>2016 – 2020</td>
+                                </tr>
+                                <tr>
+                                    <td>Jr. Software Eng.</td><td>Techlogix Pakistan</td><td>2013 – 2014</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="anno-box">Milestone 1: Tables show raw extracted data. Full LLM analysis (research profile, skill alignment, gap detection) deferred to later milestones.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FRAME 3: Multi-Candidate Overview -->
+        <div class="frame-wrap">
+            <div class="frame-name">Frame 3 — Multi-Candidate Overview & Comparison</div>
+            <div class="frame">
+                <div class="wf-nav">
+                    <div class="wf-nav-logo"></div>
+                    <div class="wf-nav-pill" style="width:55px"></div>
+                    <div class="wf-nav-pill" style="width:70px"></div>
+                    <div class="wf-nav-pill" style="width:48px"></div>
+                    <div class="wf-nav-avatar"></div>
+                </div>
+                <div class="body">
+                    <div class="wf-page-label">Frame 3 of 3 — Multi-Candidate Overview (Milestone 1 Preview)</div>
+
+                    <div class="sec-head">Candidates Processed</div>
+
+                    <div class="filter-row">
+                        <div class="f-search">
+                            <svg style="width:10px;height:10px;stroke:#aaa;fill:none;stroke-width:1.5;flex-shrink:0" viewBox="0 0 10 10"><circle cx="4" cy="4" r="3"/><line x1="6.5" y1="6.5" x2="9" y2="9"/></svg>
+                            Search candidates…
+                        </div>
+                        <div class="f-sel">Status: All</div>
+                    </div>
+
+                    <table class="tbl">
+                        <thead>
+                            <tr>
+                                <th style="width:20%">Candidate</th>
+                                <th style="width:15%">File</th>
+                                <th style="width:12%">Status</th>
+                                <th style="width:12%">Education</th>
+                                <th style="width:12%">Experience</th>
+                                <th style="width:12%">Pub/Skills</th>
+                                <th style="width:17%">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td style="font-weight:600">Dr. Ayesha Khan</td>
+                                <td>candidate_001.pdf</td>
+                                <td><span class="badge">✓ Complete</span></td>
+                                <td>3 records</td><td>3 records</td><td>38 / 12</td>
+                                <td><span class="wf-btn-sm">View Details</span> <span class="wf-btn-sm">Export CSV</span></td>
+                            </tr>
+                            <tr>
+                                <td style="font-weight:600">Prof. Ibrahim A.</td>
+                                <td>candidate_002.pdf</td>
+                                <td><span class="badge">✓ Complete</span></td>
+                                <td>3 records</td><td>4 records</td><td>22 / 8</td>
+                                <td><span class="wf-btn-sm">View Details</span> <span class="wf-btn-sm">Export CSV</span></td>
+                            </tr>
+                            <tr>
+                                <td>Farrukh Tashkentov</td>
+                                <td>candidate_003.pdf</td>
+                                <td><span class="badge">⧐ Extracting</span></td>
+                                <td>2 records</td><td>2 records</td><td>11 / 6</td>
+                                <td><span class="wf-btn-sm">View Details</span></td>
+                            </tr>
+                            <tr style="opacity:.6">
+                                <td>Dr. Nadia Okonkwo</td>
+                                <td>candidate_004.pdf</td>
+                                <td><span class="badge">⧐ Queued</span></td>
+                                <td>—</td><td>—</td><td>—</td>
+                                <td><span class="wf-btn-sm">View Details</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <div class="anno-box">Milestone 1: Basic multi-candidate table with extracted record counts. Advanced ranking, gap analysis, and scoring deferred to Milestone 2 onwards. Export CSV generates files for each candidate in relational format.</div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
