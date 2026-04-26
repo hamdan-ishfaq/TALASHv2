@@ -18,3 +18,5 @@ watchdog
 pdf2image
 pytesseract
 requests
+groq
+google-generativeai

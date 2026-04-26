@@ -65,3 +65,7 @@ backend/data/exports/
 *.xlsx
 backend/data/cvs/*
 backend/data/tmp_split/*
+*.csv
+*.log
+backend/logs/
+frontend/node_modules/

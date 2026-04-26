@@ -949,7 +949,40 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         logger.info("[4.9] ✓ Books: %d records queued", len(extracted.books))
 
         # Final commit
-        logger.info("[4.10] Committing all changes to database...")
+        logger.info("[4.10] Committing all extraction changes to database...")
+        db.commit()
+
+        # =====================================================================
+        # STAGE 5: MODULE 2 ANALYSIS & ENRICHMENT
+        # =====================================================================
+        logger.info("")
+        logger.info(STAGE_SEPARATOR)
+        logger.info("[STAGE 5] MODULE 2: ANALYSIS & ENRICHMENT PIPELINE")
+        logger.info(STAGE_SEPARATOR)
+        
+        try:
+            from app.services.education_analysis import run_education_analysis
+            from app.services.experience_analysis import run_experience_analysis
+            from app.services.research_analysis import run_research_analysis
+            from app.services.summary_generator import generate_candidate_summary
+            
+            logger.info("[5.1] Running Education Analysis...")
+            run_education_analysis(db, candidate.id)
+            
+            logger.info("[5.2] Running Experience Analysis...")
+            run_experience_analysis(db, candidate.id)
+            
+            logger.info("[5.3] Running Research Quality Analysis (CSV Lookups)...")
+            run_research_analysis(db, candidate.id)
+            
+            logger.info("[5.4] Generating Executive Summary...")
+            generate_candidate_summary(db, candidate.id)
+            
+            logger.info("[STAGE 5] ✓ Analysis pipeline completed successfully")
+        except Exception as analysis_err:
+            logger.error("[STAGE 5] Analysis pipeline failed: %s", analysis_err, exc_info=True)
+            # We don't fail the whole task, just log the error
+        
         candidate.status = "completed"
         candidate.analysis_json = json.dumps(db_save_counts, default=str)
         db.commit()

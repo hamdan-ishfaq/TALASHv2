@@ -149,19 +149,26 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
         "id": candidate.id,
         "name": candidate.name,
         "email": candidate.email,
+        "phone": candidate.phone,
+        "linkedin_url": candidate.linkedin_url,
         "status": candidate.status,
         "file_hash": candidate.file_hash,
         "file_path": candidate.file_path,
-        "raw_text": candidate.raw_text,
         "summary": candidate.summary,
         "education_records": [
             {
                 "id": rec.id,
-                "degree_level": rec.degree_level,
-                "title": rec.title,
+                "stage": rec.stage,
+                "degree_title": rec.degree_title,
+                "specialization": rec.specialization,
                 "institution": rec.institution,
-                "passing_year": rec.passing_year,
+                "start_year": rec.start_year,
+                "end_year": rec.end_year,
                 "cgpa": rec.cgpa,
+                "cgpa_scale": rec.cgpa_scale,
+                "normalized_cgpa": rec.normalized_cgpa,
+                "marks_percentage": rec.marks_percentage,
+                "qs_ranking": rec.institution_qs_ranking,
             }
             for rec in candidate.education_records
         ],
@@ -171,29 +178,48 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
                 "job_title": exp.job_title,
                 "organization": exp.organization,
                 "location": exp.location,
-                "start_date": exp.start_date.isoformat() if exp.start_date else None,
-                "end_date": exp.end_date.isoformat() if exp.end_date else None,
+                "employment_type": exp.employment_type,
+                "start_year": exp.start_year,
+                "start_month": exp.start_month,
+                "end_year": exp.end_year,
+                "end_month": exp.end_month,
                 "is_current": exp.is_current,
+                "is_academic_role": exp.is_academic_role,
             }
             for exp in candidate.work_experiences
         ],
-        "publications": [
+        "journal_publications": [
             {
                 "id": pub.id,
                 "title": pub.title,
                 "authors": pub.authors,
-                "venue": pub.venue,
+                "journal_name": pub.journal_name,
                 "year": pub.year,
-                "type": pub.type,
+                "quartile": pub.quartile,
+                "impact_factor": pub.impact_factor,
+                "authorship_role": pub.authorship_role,
             }
-            for pub in candidate.publications
+            for pub in candidate.journal_publications
+        ],
+        "conference_publications": [
+            {
+                "id": pub.id,
+                "title": pub.title,
+                "authors": pub.authors,
+                "conference_name": pub.conference_name,
+                "year": pub.year,
+                "core_ranking": pub.core_ranking,
+                "authorship_role": pub.authorship_role,
+            }
+            for pub in candidate.conference_publications
         ],
         "supervision_records": [
             {
                 "id": rec.id,
-                "level": rec.level,
+                "student_level": rec.student_level,
                 "student_name": rec.student_name,
-                "year": rec.year,
+                "completion_year": rec.completion_year,
+                "supervision_role": rec.supervision_role,
             }
             for rec in candidate.supervision_records
         ],
@@ -214,7 +240,6 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
                 "title": patent.title,
                 "inventors": patent.inventors,
                 "patent_no": patent.patent_no,
-                "year": patent.year,
                 "status": patent.status,
             }
             for patent in candidate.patents
@@ -223,20 +248,23 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
             {
                 "id": skill.id,
                 "name": skill.name,
+                "category": skill.category,
                 "proficiency_level": skill.proficiency_level,
-                "years_of_experience": skill.years_of_experience,
+                "strength_of_evidence": skill.strength_of_evidence,
             }
             for skill in candidate.skills
         ],
-        "scores": [
+        "assessments": [
             {
-                "id": score.id,
-                "score_type": score.score_type,
-                "score": score.score,
-                "max_score": score.max_score,
-                "notes": score.notes,
+                "id": a.id,
+                "education_score": a.education_strength_score,
+                "experience_score": a.experience_strength_score,
+                "research_score": a.research_strength_score,
+                "skill_score": a.skill_alignment_score,
+                "overall_rank": a.overall_rank,
+                "summary": a.overall_summary,
             }
-            for score in candidate.scores
+            for a in candidate.assessments
         ],
     }
     
@@ -244,3 +272,4 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
     logger.info("=" * 80)
     
     return response
+

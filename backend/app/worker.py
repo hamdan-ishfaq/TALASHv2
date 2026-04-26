@@ -9,6 +9,13 @@ celery_app = Celery(
     include=["worker.cv_tasks"],
 )
 
+from celery.signals import setup_logging
+
+@setup_logging.connect
+def config_loggers(*args, **kwargs):
+    from app.logging_config import setup_logging
+    setup_logging()
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],

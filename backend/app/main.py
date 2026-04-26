@@ -7,13 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.db import create_all_tables
 from app.routers.upload import router as upload_router
 from app.routers.admin import router as admin_router
+from app.routers.analysis_router import router as analysis_router
 from app.services.cv_queue import queue_cv_from_path
 from app.services.folder_monitor import CVFolderMonitor
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+from app.logging_config import setup_logging
+setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +66,7 @@ def on_shutdown() -> None:
 
 app.include_router(upload_router)
 app.include_router(admin_router)
+app.include_router(analysis_router)
 
 
 @app.get("/")
