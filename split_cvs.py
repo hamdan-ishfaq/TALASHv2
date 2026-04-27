@@ -127,7 +127,7 @@ if __name__ == "__main__":
     output_dir = str(script_dir / "backend" / "data" / "cvs")
     
     # Run splitter (max 3 CVs)
-    files = split_pdf(input_pdf, output_dir, max_cvs=3)
+    files = split_pdf(input_pdf, output_dir, max_cvs=5)
     
     if files:
         logger.info(f"\n✓ Generated {len(files)} CV PDFs ready for processing:")
