@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from pathlib import Path
 
@@ -267,6 +268,16 @@ def get_candidate(candidate_id: int, db: Session = Depends(get_db)) -> dict:
             for a in candidate.assessments
         ],
     }
+
+    pipeline_metrics: dict = {}
+    if candidate.analysis_json:
+        try:
+            aj = json.loads(candidate.analysis_json)
+            if isinstance(aj, dict) and isinstance(aj.get("pipeline"), dict):
+                pipeline_metrics = aj["pipeline"]
+        except Exception:
+            pipeline_metrics = {}
+    response["pipeline_metrics"] = pipeline_metrics
     
     logger.info("[GET-CANDIDATE-COMPLETE] Response prepared with all data")
     logger.info("=" * 80)

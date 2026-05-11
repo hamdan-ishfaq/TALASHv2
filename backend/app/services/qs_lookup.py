@@ -47,8 +47,14 @@ class QSRankingLookup:
     _instance: "QSRankingLookup | None" = None
     _entries: list[_QSEntry]
 
-    def __init__(self, xlsx_path: str):
+    def __init__(self, xlsx_path: str | None):
         self._entries = []
+        if not xlsx_path or not Path(xlsx_path).exists():
+            logger.warning(
+                "QS Rankings XLSX not found at %r — institution QS lookup disabled",
+                xlsx_path,
+            )
+            return
         self._load(xlsx_path)
         logger.info("QS Rankings loaded: %d institutions from %s", len(self._entries), xlsx_path)
 
@@ -92,11 +98,6 @@ class QSRankingLookup:
                 if matches:
                     xlsx_path = str(matches[0])
                     break
-            if xlsx_path is None:
-                raise FileNotFoundError(
-                    "QS Rankings XLSX not found. Place it in the project root "
-                    "(filename must contain 'QS')."
-                )
             cls._instance = cls(xlsx_path)
         return cls._instance
 

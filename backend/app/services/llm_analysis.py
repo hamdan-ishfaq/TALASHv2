@@ -193,6 +193,13 @@ def analysis_llm_call(
         Parsed JSON dict (json_mode=True) or plain string (json_mode=False).
         None on total failure.
     """
+    if os.getenv("TALASH_DISABLE_ANALYSIS_LLM", "").strip().lower() in {"1", "true", "yes"}:
+        logger.info("[LLM-ANALYSIS] Disabled via TALASH_DISABLE_ANALYSIS_LLM=1")
+        return None
+    if os.getenv("TALASH_REUSE_STORED_EXTRACTION", "").strip().lower() in {"1", "true", "yes"}:
+        logger.info("[LLM-ANALYSIS] Disabled via TALASH_REUSE_STORED_EXTRACTION=1 (offline rerun)")
+        return None
+
     last_err: Exception | None = None
 
     for attempt in range(retries):

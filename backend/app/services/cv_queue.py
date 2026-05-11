@@ -42,8 +42,38 @@ def queue_cv_from_path(file_path: str) -> dict:
         try:
             existing = db.query(Candidate).filter(Candidate.file_hash == file_hash).first()
             if existing:
-                logger.warning("[FOLDER-MONITOR-DUPLICATE] Already processed | candidate_id=%s", existing.id)
-                return {"status": "duplicate", "candidate_id": existing.id}
+                # If we previously failed this exact PDF, allow re-queuing so the pipeline can
+                # recover from transient extraction/analysis failures.
+                if existing.status == "failed":
+                    logger.warning(
+                        "[FOLDER-MONITOR-REQUEUE] Re-queueing failed CV | candidate_id=%s | file_hash=%s",
+                        existing.id,
+                        file_hash[:16],
+                    )
+                    existing.status = "queued"
+                    existing.analysis_json = None
+                    existing.summary = None
+                    db.commit()
+                    db.refresh(existing)
+
+                    async_result = process_cv.delay(existing.id)
+                    logger.info(
+                        "[FOLDER-MONITOR-REQUEUE-OK] Task queued | task_id=%s | candidate_id=%s",
+                        async_result.id,
+                        existing.id,
+                    )
+                    return {
+                        "status": "queued",
+                        "candidate_id": existing.id,
+                        "task_id": async_result.id,
+                    }
+
+                logger.warning(
+                    "[FOLDER-MONITOR-DUPLICATE] Already processed | candidate_id=%s | status=%s",
+                    existing.id,
+                    existing.status,
+                )
+                return {"status": "duplicate", "candidate_id": existing.id, "existing_status": existing.status}
 
             # Create candidate
             logger.info("[FOLDER-MONITOR] Creating candidate database record")

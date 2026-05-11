@@ -23,13 +23,14 @@ const App: React.FC = () => {
   const [dragOver, setDragOver] = useState(false);
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
 
-  const fetchDashboard = useCallback(async () => {
-    setLoading(true); setError(null);
+  const fetchDashboard = useCallback(async (isPolling = false) => {
+    if (!isPolling) setLoading(true); 
+    setError(null);
     try {
       const r = await axios.get(`${API}/analysis/dashboard`);
       setCandidates(r.data.candidates || []);
     } catch (e: any) { setError(e.response?.data?.detail || 'Failed to load dashboard'); }
-    setLoading(false);
+    if (!isPolling) setLoading(false);
   }, []);
 
   const fetchDetail = useCallback(async (id: number) => {
@@ -46,7 +47,11 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => { 
-    if (view === 'dashboard') fetchDashboard(); 
+    if (view === 'dashboard') {
+      fetchDashboard(false); 
+      const interval = setInterval(() => fetchDashboard(true), 5000);
+      return () => clearInterval(interval);
+    }
   }, [view, fetchDashboard]);
 
   useEffect(() => { 

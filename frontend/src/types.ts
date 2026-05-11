@@ -37,6 +37,35 @@ export interface CandidateAssessment {
   summary?: string;
 }
 
+export interface PipelineMetrics {
+  topic_variability?: {
+    theme_counts?: Record<string, number>;
+    dominant_theme?: string | null;
+    dominant_share_pct?: number;
+    diversity_score?: number;
+    publication_count?: number;
+    source?: string;
+  };
+  collaboration?: {
+    unique_coauthors?: number;
+    recurring_collaborators?: number;
+    avg_coauthors_per_paper?: number;
+    top_collaborators?: { name: string; shared_papers: number }[];
+  };
+  ip_format_checks?: {
+    books_checked?: number;
+    books_with_valid_isbn?: number;
+    patents_checked?: number;
+    patents_with_plausible_number?: number;
+  };
+  missing_info_modules?: string[];
+  summary?: {
+    overall_rank?: number;
+    skill_score?: number;
+    executive_summary?: string;
+  };
+}
+
 export interface CandidateDetail {
   id: number;
   name?: string;
@@ -54,6 +83,7 @@ export interface CandidateDetail {
   books: any[];
   patents: any[];
   assessments: CandidateAssessment[];
+  pipeline_metrics?: PipelineMetrics;
 }
 
 export interface UploadQueueItem {

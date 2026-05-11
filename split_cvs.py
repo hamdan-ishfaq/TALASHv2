@@ -2,7 +2,7 @@
 """
 PDF Splitter: Break CVs.pdf into individual CVs
 Separators: Blank pages
-Stores: backend/data/cvs/
+Stores: demo_cvs/
 Limit: First 3 CVs only
 """
 
@@ -127,7 +127,7 @@ if __name__ == "__main__":
     output_dir = str(script_dir / "backend" / "data" / "cvs")
     
     # Run splitter (max 3 CVs)
-    files = split_pdf(input_pdf, output_dir, max_cvs=5)
+    files = split_pdf(input_pdf, output_dir, max_cvs=2)
     
     if files:
         logger.info(f"\n✓ Generated {len(files)} CV PDFs ready for processing:")

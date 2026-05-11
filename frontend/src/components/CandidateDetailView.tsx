@@ -1,5 +1,5 @@
 import React from 'react';
-import { CandidateDetail, MissingReq } from '../types';
+import { CandidateDetail, MissingReq, PipelineMetrics } from '../types';
 import { ScoreBadge, ScoreBar, StatusBadge } from './Shared';
 
 interface CandidateDetailViewProps {
@@ -14,6 +14,7 @@ export const CandidateDetailView: React.FC<CandidateDetailViewProps> = ({
   if (!detail) return <div className="empty-state">Loading...</div>;
 
   const assessment = detail.assessments?.[0] || {};
+  const pm: PipelineMetrics | undefined = detail.pipeline_metrics;
 
   return (
     <div className="view-transition">
@@ -69,6 +70,55 @@ export const CandidateDetailView: React.FC<CandidateDetailViewProps> = ({
                 <span className="sparkle-icon">✨</span> Executive Summary
               </div>
               <div className="summary-text">{assessment.summary}</div>
+            </div>
+          )}
+
+          {/* Research breadth & collaboration (§3.6 / §3.7) */}
+          {pm && (pm.topic_variability || pm.collaboration) && (
+            <div className="section 3d-card">
+              <div className="section-head">Research Profile Analytics</div>
+              {pm.topic_variability && pm.topic_variability.publication_count ? (
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Topic variability</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    Dominant theme: <strong>{pm.topic_variability.dominant_theme || '—'}</strong>
+                    {' '}({pm.topic_variability.dominant_share_pct ?? 0}% of publications)
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+                    Diversity score: <strong>{pm.topic_variability.diversity_score ?? 0}</strong>
+                    {' '}(1 = evenly spread across themes)
+                  </div>
+                  {pm.topic_variability.theme_counts && (
+                    <ul style={{ paddingLeft: 18, fontSize: 11, marginTop: 8 }}>
+                      {Object.entries(pm.topic_variability.theme_counts).map(([k, v]) => (
+                        <li key={k}>{k}: {v}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
+              {pm.collaboration && (pm.collaboration.unique_coauthors ?? 0) > 0 ? (
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Co-authors</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    Unique co-authors: {pm.collaboration.unique_coauthors} · Recurring: {pm.collaboration.recurring_collaborators}
+                    {' '}· Avg co-authors/paper: {pm.collaboration.avg_coauthors_per_paper}
+                  </div>
+                  {pm.collaboration.top_collaborators && pm.collaboration.top_collaborators.length > 0 && (
+                    <ul style={{ paddingLeft: 18, fontSize: 11, marginTop: 8 }}>
+                      {pm.collaboration.top_collaborators.slice(0, 8).map((c, i) => (
+                        <li key={i}>{c.name} ({c.shared_papers} shared)</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
+              {pm.ip_format_checks && ((pm.ip_format_checks.books_checked ?? 0) > 0 || (pm.ip_format_checks.patents_checked ?? 0) > 0) ? (
+                <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-muted)' }}>
+                  Books (ISBN format check): {pm.ip_format_checks.books_with_valid_isbn}/{pm.ip_format_checks.books_checked} valid ·
+                  Patents (number plausibility): {pm.ip_format_checks.patents_with_plausible_number}/{pm.ip_format_checks.patents_checked}
+                </div>
+              ) : null}
             </div>
           )}
 
@@ -156,7 +206,9 @@ export const CandidateDetailView: React.FC<CandidateDetailViewProps> = ({
                   <div className="record-title">{r.conference_name}</div>
                   <div className="record-meta">
                     {r.publication_year || '?'}
-                    {r.core_rank && <span className="record-badge qs-badge">{r.core_rank} Rank</span>}
+                    {(r.core_ranking || r.core_rank) && (
+                      <span className="record-badge qs-badge">{(r.core_ranking || r.core_rank)} Rank</span>
+                    )}
                   </div>
                 </div>
               ))}

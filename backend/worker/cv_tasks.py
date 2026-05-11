@@ -15,6 +15,7 @@ import logging
 import time
 import json
 import re
+import os
 from datetime import date, datetime
 from typing import Dict, Any
 
@@ -31,6 +32,14 @@ from app.worker import celery_app
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+# =========================================================================
+# Runtime switches (avoid paid LLM re-runs)
+# =========================================================================
+# When enabled, the pipeline will reuse `Candidate.raw_text` and
+# `Candidate.raw_extraction_json` (if present) and will not call OpenRouter.
+TALASH_REUSE_STORED_EXTRACTION = os.getenv("TALASH_REUSE_STORED_EXTRACTION", "0") == "1"
 
 
 # ============================================================================
@@ -301,6 +310,8 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
     
     db = SessionLocal()
     candidate = None
+    extracted = None
+    skip_persistence = False
 
     try:
         # =====================================================================
@@ -356,25 +367,30 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         # =====================================================================
         log_stage_start(2, "Extract Text from PDF", task_id, candidate_id)
         stage_time = time.time()
-        
-        if not candidate.file_path:
-            error_msg = "Candidate file_path is empty or None"
-            logger.error("[2-ERROR] %s", error_msg)
-            result["status"] = "failed"
-            result["error"] = error_msg
-            result["error_stage"] = 2
-            raise ValueError(error_msg)
-        
-        logger.info("[2.1] Reading PDF file: %s", candidate.file_path)
-        try:
-            cv_text = extract_pdf_text(candidate.file_path)
-        except Exception as pdf_error:
-            error_msg = f"PDF extraction failed: {str(pdf_error)}"
-            logger.error("[2-PDF-ERROR] %s", error_msg)
-            result["status"] = "failed"
-            result["error"] = error_msg
-            result["error_stage"] = 2
-            raise Exception(error_msg)
+
+        # Reuse previously extracted raw_text if available (avoids re-parsing the PDF).
+        cv_text = (candidate.raw_text or "").replace("\x00", "")
+        if cv_text and len(cv_text.strip()) >= 100:
+            logger.info("[2.1] Reusing candidate.raw_text (%d chars)", len(cv_text))
+        else:
+            if not candidate.file_path:
+                error_msg = "Candidate file_path is empty or None and no reusable raw_text exists"
+                logger.error("[2-ERROR] %s", error_msg)
+                result["status"] = "failed"
+                result["error"] = error_msg
+                result["error_stage"] = 2
+                raise ValueError(error_msg)
+
+            logger.info("[2.1] Reading PDF file: %s", candidate.file_path)
+            try:
+                cv_text = extract_pdf_text(candidate.file_path)
+            except Exception as pdf_error:
+                error_msg = f"PDF extraction failed: {str(pdf_error)}"
+                logger.error("[2-PDF-ERROR] %s", error_msg)
+                result["status"] = "failed"
+                result["error"] = error_msg
+                result["error_stage"] = 2
+                raise Exception(error_msg)
         
         if not cv_text or len(cv_text.strip()) < 100:
             error_msg = f"PDF extraction yielded insufficient text ({len(cv_text) if cv_text else 0} chars, minimum required: 100)"
@@ -387,8 +403,10 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         stage_duration = time.time() - stage_time
         result["timings"]["pdf_extraction"] = stage_duration
         
-        candidate.raw_text = cv_text.replace("\x00", "")
-        db.commit()
+        # Persist raw_text only if we just computed it (or it was missing).
+        if not candidate.raw_text or len((candidate.raw_text or "").strip()) < 100:
+            candidate.raw_text = cv_text.replace("\x00", "")
+            db.commit()
         logger.info("[2.2] PDF extraction successful")
         logger.info("      ├─ Text length: %d characters", len(cv_text))
         logger.info("      ├─ Paragraphs: ~%d", len(cv_text.split('\n')))
@@ -400,65 +418,119 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         log_stage_start(3, "Sequential LLM Extraction (OpenRouter Free Tier)", task_id, candidate_id)
         stage_time = time.time()
         llm_router.reset_stats()
+
+        # -----------------------------------------------------------------
+        # OFFLINE / REUSE MODE (avoid paid OpenRouter calls on reruns)
+        # -----------------------------------------------------------------
+        if TALASH_REUSE_STORED_EXTRACTION:
+            # If normalized tables already exist, do NOT delete/overwrite them —
+            # just re-run analysis modules. This is the safest rerun mode.
+            has_any_rows = (
+                db.query(EducationRecord.id).filter(EducationRecord.candidate_id == candidate.id).first()
+                or db.query(WorkExperience.id).filter(WorkExperience.candidate_id == candidate.id).first()
+                or db.query(JournalPublication.id).filter(JournalPublication.candidate_id == candidate.id).first()
+                or db.query(ConferencePublication.id).filter(ConferencePublication.candidate_id == candidate.id).first()
+                or db.query(Skill.id).filter(Skill.candidate_id == candidate.id).first()
+                or db.query(Book.id).filter(Book.candidate_id == candidate.id).first()
+                or db.query(Patent.id).filter(Patent.candidate_id == candidate.id).first()
+                or db.query(SupervisionRecord.id).filter(SupervisionRecord.candidate_id == candidate.id).first()
+            )
+
+            if has_any_rows:
+                logger.info(
+                    "[3.0] TALASH_REUSE_STORED_EXTRACTION=1 — tables are populated; skipping OpenRouter and persistence"
+                )
+                skip_persistence = True
+                result["llm_summary"] = _merge_llm_snapshots([])
+            elif candidate.raw_extraction_json:
+                logger.info(
+                    "[3.0] TALASH_REUSE_STORED_EXTRACTION=1 — tables empty; using candidate.raw_extraction_json (no OpenRouter)"
+                )
+                try:
+                    from app.schemas.extraction import CandidateExtraction
+                    extracted = CandidateExtraction.model_validate_json(candidate.raw_extraction_json)
+                    result["llm_summary"] = _merge_llm_snapshots([])
+                except Exception as parse_err:
+                    error_msg = f"Stored extraction JSON is not parseable: {parse_err}"
+                    logger.error("[3.0-REUSE-ERROR] %s", error_msg)
+                    result["status"] = "failed"
+                    result["error"] = error_msg
+                    result["error_stage"] = 3
+                    raise
+            else:
+                # Robustness: reuse-mode should never hard-fail brand-new candidates.
+                # If there is no stored extraction and no populated normalized tables,
+                # fall back to fresh OpenRouter extraction.
+                logger.warning(
+                    "[3.0-REUSE-WARN] TALASH_REUSE_STORED_EXTRACTION=1 but no stored extraction/tables found; "
+                    "falling back to OpenRouter extraction."
+                )
+                # Keep `extracted=None` and `skip_persistence=False` so the normal sequential
+                # extraction path below runs.
         
-        logger.info("[3.1] Starting SEQUENTIAL section extraction (no parallel fan-out)...")
-        logger.info("[3.1] Strategy: core -> delay -> academic -> delay -> skills")
+        if extracted is None and not skip_persistence:
+            logger.info("[3.1] Starting SEQUENTIAL section extraction (no parallel fan-out)...")
+            logger.info("[3.1] Strategy: core -> delay -> academic -> delay -> skills")
+        else:
+            logger.info("[3.1] Skipping OpenRouter section extraction (reuse mode)")
+
         try:
             # ---------------------------------------------------------------
             # SEQUENTIAL extraction: call each section in-process with delays
             # instead of Celery group() to respect free-tier rate limits.
             # ---------------------------------------------------------------
-            logger.info("[3.2] Extracting CORE section...")
-            core_payload = _extract_section_payload(cv_text, "core")
-            logger.info(
-                "[3.2] CORE complete | name=%s | edu=%d | exp=%d",
-                core_payload.get("name"),
-                len(core_payload.get("education", []) or []),
-                len(core_payload.get("experience", []) or []),
-            )
+            if extracted is None and not skip_persistence:
+                logger.info("[3.2] Extracting CORE section...")
+                core_payload = _extract_section_payload(cv_text, "core")
+                logger.info(
+                    "[3.2] CORE complete | name=%s | edu=%d | exp=%d",
+                    core_payload.get("name"),
+                    len(core_payload.get("education", []) or []),
+                    len(core_payload.get("experience", []) or []),
+                )
 
-            # The inter-request delay is already built into CVExtractorService.extract_cv_data(),
-            # but since we call _extract_section_payload directly here, we add our own delay.
-            from app.services.extractor import OPENROUTER_INTER_REQUEST_DELAY
-            if OPENROUTER_INTER_REQUEST_DELAY > 0:
-                logger.info("[3.2] Waiting %ds before academic section (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
-                time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+                # The inter-request delay is already built into CVExtractorService.extract_cv_data(),
+                # but since we call _extract_section_payload directly here, we add our own delay.
+                from app.services.extractor import OPENROUTER_INTER_REQUEST_DELAY
+                if OPENROUTER_INTER_REQUEST_DELAY > 0:
+                    logger.info("[3.2] Waiting %ds before academic section (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
+                    time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
 
-            logger.info("[3.3] Extracting ACADEMIC section...")
-            academic_payload = _extract_section_payload(cv_text, "academic")
-            logger.info(
-                "[3.3] ACADEMIC complete | publications=%d | supervision=%d | books=%d",
-                len(academic_payload.get("publications", []) or []),
-                len(academic_payload.get("supervision", []) or []),
-                len(academic_payload.get("books", []) or []),
-            )
+                logger.info("[3.3] Extracting ACADEMIC section...")
+                academic_payload = _extract_section_payload(cv_text, "academic")
+                logger.info(
+                    "[3.3] ACADEMIC complete | publications=%d | supervision=%d | books=%d",
+                    len(academic_payload.get("publications", []) or []),
+                    len(academic_payload.get("supervision", []) or []),
+                    len(academic_payload.get("books", []) or []),
+                )
 
-            if OPENROUTER_INTER_REQUEST_DELAY > 0:
-                logger.info("[3.3] Waiting %ds before skills section (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
-                time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+                if OPENROUTER_INTER_REQUEST_DELAY > 0:
+                    logger.info("[3.3] Waiting %ds before skills section (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
+                    time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
 
-            logger.info("[3.4] Extracting SKILLS & IP section...")
-            skills_payload = _extract_section_payload(cv_text, "skills")
-            logger.info(
-                "[3.4] SKILLS complete | patents=%d | skills=%d",
-                len(skills_payload.get("patents", []) or []),
-                len(skills_payload.get("skills", []) or []),
-            )
+                logger.info("[3.4] Extracting SKILLS & IP section...")
+                skills_payload = _extract_section_payload(cv_text, "skills")
+                logger.info(
+                    "[3.4] SKILLS complete | patents=%d | skills=%d",
+                    len(skills_payload.get("patents", []) or []),
+                    len(skills_payload.get("skills", []) or []),
+                )
 
-            # --- Aggregate section payloads for stats ---
-            section_payloads = [core_payload, academic_payload, skills_payload]
+                # --- Aggregate section payloads for stats ---
+                section_payloads = [core_payload, academic_payload, skills_payload]
 
-            # --- Normalise null → [] for list fields before Pydantic sees them ---
-            core_payload = normalize_nulls(core_payload)
-            academic_payload = normalize_nulls(academic_payload)
-            skills_payload = normalize_nulls(skills_payload)
-            core = CoreProfileExtraction.model_validate(core_payload)
-            academic = AcademicProfileExtraction.model_validate(academic_payload)
-            skills_and_ip = SkillsAndIPExtraction.model_validate(skills_payload)
+                # --- Normalise null → [] for list fields before Pydantic sees them ---
+                core_payload = normalize_nulls(core_payload)
+                academic_payload = normalize_nulls(academic_payload)
+                skills_payload = normalize_nulls(skills_payload)
+                core = CoreProfileExtraction.model_validate(core_payload)
+                academic = AcademicProfileExtraction.model_validate(academic_payload)
+                skills_and_ip = SkillsAndIPExtraction.model_validate(skills_payload)
 
-            extractor_service = CVExtractorService()
-            extracted = extractor_service.aggregate_sections(cv_text, core, academic, skills_and_ip)
-            result["llm_summary"] = _merge_llm_snapshots(section_payloads)
+                extractor_service = CVExtractorService()
+                extracted = extractor_service.aggregate_sections(cv_text, core, academic, skills_and_ip)
+                result["llm_summary"] = _merge_llm_snapshots(section_payloads)
         except Exception as llm_error:
             error_msg = f"LLM extraction failed: {str(llm_error)}"
             logger.error("[3-LLM-ERROR] %s", error_msg)
@@ -468,7 +540,12 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
             result["error_stage"] = 3
             raise Exception(error_msg)
         
-        if not extracted:
+        if skip_persistence:
+            stage_duration = time.time() - stage_time
+            result["timings"]["llm_extraction"] = stage_duration
+            if "llm_summary" not in result:
+                result["llm_summary"] = _merge_llm_snapshots([])
+        elif not extracted:
             error_msg = "LLM extraction returned None"
             logger.error("[3-LLM-ERROR] %s", error_msg)
             result["status"] = "failed"
@@ -476,7 +553,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
             result["error_stage"] = 3
             raise ValueError(error_msg)
         
-        if not extracted.name or extracted.name == "Extraction Failed":
+        if (not skip_persistence) and (not extracted.name or extracted.name == "Extraction Failed"):
             error_msg = f"LLM extraction returned invalid name: '{extracted.name}'"
             logger.error("[3-LLM-ERROR] %s", error_msg)
             if extracted.summary_of_profile:
@@ -486,118 +563,184 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
             result["error_stage"] = 3
             raise ValueError(error_msg)
         
-        stage_duration = time.time() - stage_time
-        result["timings"]["llm_extraction"] = stage_duration
-        result["name"] = extracted.name
-        if "llm_summary" not in result:
-            result["llm_summary"] = _merge_llm_snapshots([])
-        
-        logger.info("[3.5] LLM extraction successful")
-        logger.info("      ├─ Candidate Name: %s", extracted.name)
-        logger.info("      ├─ Email: %s", extracted.email or "NOT PROVIDED")
-        logger.info("      ├─ Education Records: %d", len(extracted.education_records))
-        logger.info("      ├─ Work Experiences: %d", len(extracted.work_experiences))
-        logger.info("      ├─ Journal Publications: %d", len(extracted.journal_publications))
-        logger.info("      ├─ Conference Publications: %d", len(extracted.conference_publications))
-        logger.info("      ├─ Supervision Records: %d", len(extracted.supervision_records))
-        logger.info("      ├─ Skills: %d", len(extracted.skills))
-        logger.info("      ├─ Patents: %d", len(extracted.patents))
-        logger.info("      ├─ Books: %d", len(extracted.books))
-        logger.info("      └─ Duration: %.2f sec (including rate-limit delays)", stage_duration)
-        logger.info(
-            "[3.6] Aggregated section summary | core=%d | academic=%d | skills=%d",
-            len(core.education) + len(core.experience),
-            len(academic.publications) + len(academic.supervision) + len(academic.books),
-            len(skills_and_ip.patents) + len(skills_and_ip.skills),
-        )
-        logger.info(
-            _format_merged_summary(
-                result["llm_summary"],
-                title=f"LLM REQUEST SUMMARY | CandidateID: {candidate_id} | TaskID: {task_id}",
+        if not skip_persistence:
+            stage_duration = time.time() - stage_time
+            result["timings"]["llm_extraction"] = stage_duration
+            result["name"] = extracted.name
+            if "llm_summary" not in result:
+                result["llm_summary"] = _merge_llm_snapshots([])
+
+            logger.info("[3.5] LLM extraction successful")
+            logger.info("      ├─ Candidate Name: %s", extracted.name)
+            logger.info("      ├─ Email: %s", extracted.email or "NOT PROVIDED")
+            logger.info("      ├─ Education Records: %d", len(extracted.education_records))
+            logger.info("      ├─ Work Experiences: %d", len(extracted.work_experiences))
+            logger.info("      ├─ Journal Publications: %d", len(extracted.journal_publications))
+            logger.info("      ├─ Conference Publications: %d", len(extracted.conference_publications))
+            logger.info("      ├─ Supervision Records: %d", len(extracted.supervision_records))
+            logger.info("      ├─ Skills: %d", len(extracted.skills))
+            logger.info("      ├─ Patents: %d", len(extracted.patents))
+            logger.info("      ├─ Books: %d", len(extracted.books))
+            logger.info("      └─ Duration: %.2f sec (including rate-limit delays)", stage_duration)
+
+            try:
+                logger.info(
+                    "[3.6] Aggregated section summary | core=%d | academic=%d | skills=%d",
+                    len(core.education) + len(core.experience),
+                    len(academic.publications) + len(academic.supervision) + len(academic.books),
+                    len(skills_and_ip.patents) + len(skills_and_ip.skills),
+                )
+            except Exception:
+                pass
+
+            logger.info(
+                _format_merged_summary(
+                    result["llm_summary"],
+                    title=f"LLM REQUEST SUMMARY | CandidateID: {candidate_id} | TaskID: {task_id}",
+                )
             )
-        )
 
         # =====================================================================
         # STAGE 3.5: VALIDATION AGGREGATOR (PRE-PERSISTENCE)
         # =====================================================================
         extraction_flags: list[str] = []
 
-        publication_count = len(extracted.journal_publications) + len(extracted.conference_publications)
-        if publication_count == 0 and _has_publication_signals(cv_text):
-            logger.warning(
-                "[3.5-VALIDATION] Publication signals found in raw text but extracted publications are empty. "
-                "Triggering academic section re-extraction."
-            )
-            try:
-                # Rate-limit delay before retry
-                if OPENROUTER_INTER_REQUEST_DELAY > 0:
-                    logger.info("[3.5] Waiting %ds before academic retry (rate-limit safety)...", OPENROUTER_INTER_REQUEST_DELAY)
-                    time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+        # In reuse modes, we don't attempt any OpenRouter retries or email/name
+        # heuristics; we just carry a flag for auditability.
+        if skip_persistence:
+            extraction_flags.append("REUSE_MODE_SKIPPED_EXTRACTION")
+        elif TALASH_REUSE_STORED_EXTRACTION:
+            extraction_flags.append("REUSE_MODE_USED_STORED_JSON")
+        else:
+            from app.services.extractor import OPENROUTER_INTER_REQUEST_DELAY
 
-                retry_service = CVExtractorService()
-                academic_retry = retry_service.extract_section(cv_text, "academic")
-                if isinstance(academic_retry, AcademicProfileExtraction):
-                    academic = academic_retry
-                    extracted = retry_service.aggregate_sections(cv_text, core, academic, skills_and_ip)
-                    logger.info(
-                        "[3.5-VALIDATION] Academic re-extraction complete | journals=%d | conferences=%d",
-                        len(extracted.journal_publications),
-                        len(extracted.conference_publications),
+            publication_count = len(extracted.journal_publications) + len(extracted.conference_publications)
+            if publication_count == 0 and _has_publication_signals(cv_text):
+                logger.warning(
+                    "[3.5-VALIDATION] Publication signals found in raw text but extracted publications are empty. "
+                    "Triggering academic section re-extraction."
+                )
+                try:
+                    if OPENROUTER_INTER_REQUEST_DELAY > 0:
+                        logger.info(
+                            "[3.5] Waiting %ds before academic retry (rate-limit safety)...",
+                            OPENROUTER_INTER_REQUEST_DELAY,
+                        )
+                        time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
+
+                    retry_service = CVExtractorService()
+                    academic_retry = retry_service.extract_section(cv_text, "academic")
+                    if isinstance(academic_retry, AcademicProfileExtraction):
+                        academic = academic_retry
+                        extracted = retry_service.aggregate_sections(cv_text, core, academic, skills_and_ip)
+                        logger.info(
+                            "[3.5-VALIDATION] Academic re-extraction complete | journals=%d | conferences=%d",
+                            len(extracted.journal_publications),
+                            len(extracted.conference_publications),
+                        )
+                except Exception as retry_error:
+                    logger.warning(
+                        "[3.5-VALIDATION] Academic re-extraction failed: %s",
+                        str(retry_error),
+                        exc_info=True,
                     )
-            except Exception as retry_error:
-                logger.warning(
-                    "[3.5-VALIDATION] Academic re-extraction failed: %s",
-                    str(retry_error),
-                    exc_info=True,
-                )
-            # Check if re-extraction still yielded nothing
-            re_pub_count = len(extracted.journal_publications) + len(extracted.conference_publications)
-            if re_pub_count == 0:
-                extraction_flags.append("ACADEMIC_EXTRACTION_FAILED")
-                logger.warning(
-                    "[3.5-FLAG] ACADEMIC_EXTRACTION_FAILED — publications signals present but "
-                    "extraction yielded 0 after retry. Candidate requires manual review."
-                )
 
-        if extracted.email and not _email_matches_candidate_name(extracted.name, extracted.email):
-            logger.warning(
-                "[3.5-VALIDATION] Suspicious email/name mismatch detected. "
-                "Preserving raw email for audit and clearing active field. "
-                "name=%s | email=%s",
-                extracted.name,
-                extracted.email,
-            )
-            # Preserve original for audit trail (Fix 4)
-            candidate.raw_extracted_email = extracted.email
-            extraction_flags.append("EMAIL_MISMATCH_MANUAL_REVIEW")
-            extracted.email = None
+                re_pub_count = len(extracted.journal_publications) + len(extracted.conference_publications)
+                if re_pub_count == 0:
+                    extraction_flags.append("ACADEMIC_EXTRACTION_FAILED")
+                    logger.warning(
+                        "[3.5-FLAG] ACADEMIC_EXTRACTION_FAILED — publications signals present but "
+                        "extraction yielded 0 after retry. Candidate requires manual review."
+                    )
 
-        try:
-            if _email_conflicts(db, candidate.id, extracted.email):
+            if extracted.email and not _email_matches_candidate_name(extracted.name, extracted.email):
                 logger.warning(
-                    "[4.1] Skipping duplicate email write for candidate_id=%d | email=%s",
-                    candidate.id,
+                    "[3.5-VALIDATION] Suspicious email/name mismatch detected. "
+                    "Preserving raw email for audit and clearing active field. "
+                    "name=%s | email=%s",
+                    extracted.name,
                     extracted.email,
                 )
-            db.add(ExtractionRun(
-                candidate_id=candidate.id,
-                provider=extracted.llm_provider or "openrouter",
-                model_name=extracted.llm_model_name or "openrouter/free",
-                prompt_version="v1-lossless",
-                run_type="primary",
-                status="completed",
-                raw_response_json=getattr(extracted, "raw_llm_response", None) or candidate.raw_extraction_json,
-                parsed_ok=True,
-                error_message=None,
-            ))
-        except Exception:
-            logger.warning("[3-RUN] Could not record extraction run metadata", exc_info=True)
+                candidate.raw_extracted_email = extracted.email
+                extraction_flags.append("EMAIL_MISMATCH_MANUAL_REVIEW")
+                extracted.email = None
+
+            try:
+                if _email_conflicts(db, candidate.id, extracted.email):
+                    logger.warning(
+                        "[4.1] Skipping duplicate email write for candidate_id=%d | email=%s",
+                        candidate.id,
+                        extracted.email,
+                    )
+                db.add(
+                    ExtractionRun(
+                        candidate_id=candidate.id,
+                        provider=extracted.llm_provider or "openrouter",
+                        model_name=extracted.llm_model_name or "openrouter/free",
+                        prompt_version="v1-lossless",
+                        run_type="primary",
+                        status="completed",
+                        raw_response_json=getattr(extracted, "raw_llm_response", None)
+                        or candidate.raw_extraction_json,
+                        parsed_ok=True,
+                        error_message=None,
+                    )
+                )
+            except Exception:
+                logger.warning("[3-RUN] Could not record extraction run metadata", exc_info=True)
 
         # =====================================================================
         # STAGE 4: PERSIST TO DATABASE
         # =====================================================================
         log_stage_start(4, "Persist Extracted Data to Database", task_id, candidate_id)
         stage_time = time.time()
+
+        if skip_persistence:
+            logger.info("[4.0] Persistence skipped (reuse mode) — keeping existing normalized tables")
+            db_save_counts: dict[str, int] = {}
+
+            # =================================================================
+            # STAGE 5: MODULE 2 ANALYSIS & ENRICHMENT
+            # =================================================================
+            logger.info("")
+            logger.info(STAGE_SEPARATOR)
+            logger.info("[STAGE 5] MODULE 2: ANALYSIS & ENRICHMENT PIPELINE")
+            logger.info(STAGE_SEPARATOR)
+
+            try:
+                from app.services.pipeline import run_full_talash_analysis
+
+                logger.info("[5.0] Running full TALASH analysis pipeline...")
+                pipeline_out = run_full_talash_analysis(db, candidate.id)
+                analysis_blob = {"extraction_counts": db_save_counts, "pipeline": pipeline_out}
+                candidate.analysis_json = json.dumps(analysis_blob, default=str)
+                logger.info("[STAGE 5] ✓ Analysis pipeline completed successfully")
+            except Exception as analysis_err:
+                logger.error("[STAGE 5] Analysis pipeline failed: %s", analysis_err, exc_info=True)
+                candidate.analysis_json = json.dumps(
+                    {"extraction_counts": db_save_counts, "pipeline_error": str(analysis_err)},
+                    default=str,
+                )
+
+            candidate.status = "completed"
+            db.commit()
+
+            result["timings"]["database_persistence"] = 0.0
+            result["counts"] = db_save_counts
+
+            total_duration = time.time() - task_start_time
+            result["status"] = "completed"
+            result["timings"]["total"] = total_duration
+
+            logger.info("")
+            logger.info(STAGE_SEPARATOR)
+            logger.info("[TASK-SUCCESS] ===== CV PROCESSING COMPLETED (REUSE MODE) =====")
+            logger.info("[TASK-SUCCESS] CandidateID: %d | Name: %s", candidate_id, candidate.name)
+            logger.info("[TASK-SUCCESS] Total Duration: %.2f sec", total_duration)
+            logger.info(STAGE_SEPARATOR)
+            logger.info("")
+
+            return result
         
         logger.info("[4.1] Updating candidate PII...")
         candidate.name = extracted.name or candidate.name
@@ -961,30 +1104,21 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         logger.info(STAGE_SEPARATOR)
         
         try:
-            from app.services.education_analysis import run_education_analysis
-            from app.services.experience_analysis import run_experience_analysis
-            from app.services.research_analysis import run_research_analysis
-            from app.services.summary_generator import generate_candidate_summary
-            
-            logger.info("[5.1] Running Education Analysis...")
-            run_education_analysis(db, candidate.id)
-            
-            logger.info("[5.2] Running Experience Analysis...")
-            run_experience_analysis(db, candidate.id)
-            
-            logger.info("[5.3] Running Research Quality Analysis (CSV Lookups)...")
-            run_research_analysis(db, candidate.id)
-            
-            logger.info("[5.4] Generating Executive Summary...")
-            generate_candidate_summary(db, candidate.id)
-            
+            from app.services.pipeline import run_full_talash_analysis
+
+            logger.info("[5.0] Running full TALASH analysis pipeline...")
+            pipeline_out = run_full_talash_analysis(db, candidate.id)
+            analysis_blob = {"extraction_counts": db_save_counts, "pipeline": pipeline_out}
+            candidate.analysis_json = json.dumps(analysis_blob, default=str)
             logger.info("[STAGE 5] ✓ Analysis pipeline completed successfully")
         except Exception as analysis_err:
             logger.error("[STAGE 5] Analysis pipeline failed: %s", analysis_err, exc_info=True)
-            # We don't fail the whole task, just log the error
-        
+            candidate.analysis_json = json.dumps(
+                {"extraction_counts": db_save_counts, "pipeline_error": str(analysis_err)},
+                default=str,
+            )
+
         candidate.status = "completed"
-        candidate.analysis_json = json.dumps(db_save_counts, default=str)
         db.commit()
         
         stage_duration = time.time() - stage_time

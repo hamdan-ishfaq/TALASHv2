@@ -186,9 +186,42 @@ class DashboardResponse(BaseModel):
     candidates: list[DashboardCandidate]
 
 
+class RankingRow(BaseModel):
+    rank: int
+    candidate_id: int
+    name: Optional[str]
+    overall_rank: Optional[float]
+    education_score: Optional[float]
+    research_score: Optional[float]
+    experience_score: Optional[float]
+    skill_score: Optional[float]
+
+
+class RankingResponse(BaseModel):
+    candidates: list[RankingRow]
+
+
 class MissingInfoResponse(BaseModel):
     candidate_id: int
     requests: list[dict]
+
+
+class MissingInfoGenerateRequest(BaseModel):
+    modules: list[str] | None = None
+    force: bool = False
+
+
+class MissingInfoGenerateResponse(BaseModel):
+    candidate_id: int
+    generated_modules: list[str]
+
+
+class SkillAlignmentResponse(BaseModel):
+    candidate_id: int
+    skills_total: int
+    skills_strong: int
+    skills_partial: int
+    score: float
 
 
 # ===========================================================================
@@ -543,20 +576,34 @@ def batch_full_pipeline(payload: BatchRequest, db: Session = Depends(get_db)):
     else:
         ids = [row.id for row in db.query(Candidate.id).all()]
 
+    from app.services.pipeline import run_full_talash_analysis
+
     results = []
     succeeded = 0
     failed = 0
     for cid in ids:
         try:
-            edu_result = run_education_analysis(db, cid)
-            exp_result = run_experience_analysis(db, cid)
-            summary_result = generate_candidate_summary(db, cid)
+            pipe = run_full_talash_analysis(db, cid)
+            summ = pipe.get("summary") or {}
+            cand = db.query(Candidate).filter_by(id=cid).first()
+            if cand:
+                prev: dict = {}
+                if cand.analysis_json:
+                    try:
+                        prev = json.loads(cand.analysis_json)
+                    except Exception:
+                        prev = {}
+                merged = {**prev, "pipeline": pipe, "source": "api_batch_full_pipeline"}
+                cand.analysis_json = json.dumps(merged, default=str)
+                db.commit()
             results.append({
                 "candidate_id": cid,
                 "status": "ok",
-                "education_score": edu_result.education_strength_score,
-                "experience_score": exp_result.experience_strength_score,
-                "overall_rank": summary_result["overall_rank"],
+                "education_score": summ.get("education_score"),
+                "experience_score": summ.get("experience_score"),
+                "research_score": summ.get("research_score"),
+                "skill_score": summ.get("skill_score"),
+                "overall_rank": summ.get("overall_rank"),
             })
             succeeded += 1
         except Exception as exc:
@@ -577,10 +624,30 @@ def full_pipeline(candidate_id: int, db: Session = Depends(get_db)):
     if not candidate:
         raise HTTPException(status_code=404, detail=f"Candidate {candidate_id} not found")
 
+    from app.services.pipeline import run_full_talash_analysis
+
     try:
-        run_education_analysis(db, candidate_id)
-        run_experience_analysis(db, candidate_id)
-        result = generate_candidate_summary(db, candidate_id)
+        pipe = run_full_talash_analysis(db, candidate_id)
+        result = {
+            "overall_rank": pipe["summary"]["overall_rank"],
+            "education_score": pipe["summary"]["education_score"],
+            "research_score": pipe["summary"]["research_score"],
+            "experience_score": pipe["summary"]["experience_score"],
+            "skill_score": pipe["summary"]["skill_score"],
+            "summary": pipe["summary"].get("executive_summary"),
+            "llm_used": bool(pipe["summary"].get("llm_used")),
+        }
+        prev = {}
+        if candidate.analysis_json:
+            try:
+                prev = json.loads(candidate.analysis_json)
+            except Exception:
+                prev = {}
+        if isinstance(prev, dict) and "extraction_counts" in prev:
+            candidate.analysis_json = json.dumps({**prev, "pipeline": pipe}, default=str)
+        else:
+            candidate.analysis_json = json.dumps({"pipeline": pipe, "source": "api_full_pipeline"}, default=str)
+        db.commit()
     except Exception as exc:
         logger.exception("Full pipeline failed for candidate %d: %s", candidate_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -603,10 +670,10 @@ def full_pipeline(candidate_id: int, db: Session = Depends(get_db)):
 @router.get(
     "/dashboard",
     response_model=DashboardResponse,
-    summary="Get all candidates with analysis scores for dashboard view",
+    summary="Get successfully processed candidates for dashboard (status=completed only)",
 )
 def get_dashboard(db: Session = Depends(get_db)):
-    candidates = db.query(Candidate).all()
+    candidates = db.query(Candidate).filter(Candidate.status == "completed").all()
 
     dashboard_candidates = []
     for cand in candidates:
@@ -648,6 +715,46 @@ def get_dashboard(db: Session = Depends(get_db)):
     )
 
 
+@router.get(
+    "/ranking",
+    response_model=RankingResponse,
+    summary="Extra: quantifiable ordering of candidates by overall_rank (higher first)",
+)
+def get_candidate_ranking(db: Session = Depends(get_db)):
+    """Bonus-style ranking: completed candidates only, by latest overall_rank descending."""
+    rows: list[tuple[Candidate, Optional[CandidateAssessment]]] = []
+    for cand in db.query(Candidate).filter(Candidate.status == "completed").all():
+        assessment = (
+            db.query(CandidateAssessment)
+            .filter_by(candidate_id=cand.id)
+            .order_by(CandidateAssessment.generated_at.desc())
+            .first()
+        )
+        rows.append((cand, assessment))
+
+    def sort_key(item: tuple[Candidate, Optional[CandidateAssessment]]):
+        a = item[1]
+        rank_val = a.overall_rank if a and a.overall_rank is not None else -1.0
+        return rank_val
+
+    rows.sort(key=sort_key, reverse=True)
+    out: list[RankingRow] = []
+    for i, (cand, a) in enumerate(rows, start=1):
+        out.append(
+            RankingRow(
+                rank=i,
+                candidate_id=cand.id,
+                name=cand.name,
+                overall_rank=a.overall_rank if a else None,
+                education_score=a.education_strength_score if a else None,
+                research_score=a.research_strength_score if a else None,
+                experience_score=a.experience_strength_score if a else None,
+                skill_score=a.skill_alignment_score if a else None,
+            )
+        )
+    return RankingResponse(candidates=out)
+
+
 # ===========================================================================
 # MISSING INFO
 # ===========================================================================
@@ -677,6 +784,53 @@ def get_missing_info(candidate_id: int, db: Session = Depends(get_db)):
             }
             for r in requests
         ],
+    )
+
+
+@router.post(
+    "/missing-info/{candidate_id}/generate",
+    response_model=MissingInfoGenerateResponse,
+    summary="Generate missing information requests (offline; no LLM)",
+)
+def generate_missing_info(candidate_id: int, payload: MissingInfoGenerateRequest, db: Session = Depends(get_db)):
+    candidate = db.query(Candidate).filter_by(id=candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail=f"Candidate {candidate_id} not found")
+
+    from app.services.missing_information_service import generate_missing_information_requests
+
+    result = generate_missing_information_requests(
+        db,
+        candidate_id,
+        modules=payload.modules,
+        force=payload.force,
+    )
+    db.commit()
+    return MissingInfoGenerateResponse(
+        candidate_id=result.candidate_id,
+        generated_modules=result.generated_modules,
+    )
+
+
+@router.post(
+    "/skills/{candidate_id}",
+    response_model=SkillAlignmentResponse,
+    summary="Recompute skill alignment score (offline; no LLM)",
+)
+def recompute_skill_alignment(candidate_id: int, db: Session = Depends(get_db)):
+    candidate = db.query(Candidate).filter_by(id=candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail=f"Candidate {candidate_id} not found")
+
+    from app.services.skill_alignment import compute_and_persist_skill_alignment
+
+    result = compute_and_persist_skill_alignment(db, candidate_id)
+    return SkillAlignmentResponse(
+        candidate_id=result.candidate_id,
+        skills_total=result.skills_total,
+        skills_strong=result.skills_strong,
+        skills_partial=result.skills_partial,
+        score=result.score,
     )
 
 
