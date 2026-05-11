@@ -44,9 +44,9 @@ def queue_cv_from_path(file_path: str) -> dict:
             if existing:
                 # If we previously failed this exact PDF, allow re-queuing so the pipeline can
                 # recover from transient extraction/analysis failures.
-                if existing.status == "failed":
+                if existing.status in ("failed", "completed_with_errors"):
                     logger.warning(
-                        "[FOLDER-MONITOR-REQUEUE] Re-queueing failed CV | candidate_id=%s | file_hash=%s",
+                        "[FOLDER-MONITOR-REQUEUE] Re-queueing CV (failed or analysis errors) | candidate_id=%s | file_hash=%s",
                         existing.id,
                         file_hash[:16],
                     )

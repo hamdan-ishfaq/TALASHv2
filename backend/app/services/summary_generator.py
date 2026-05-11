@@ -32,17 +32,28 @@ from app.models.models import (
     WorkExperience,
 )
 from app.services.llm_analysis import analysis_llm_call, analysis_text_call
+from app.utils.scores import research_strength_on_ten
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Weights for overall rank
+# Weights for overall rank (faculty hiring: research + experience slightly up)
 # ---------------------------------------------------------------------------
-WEIGHT_EDUCATION = 0.25
-WEIGHT_RESEARCH = 0.35
-WEIGHT_EXPERIENCE = 0.25
+WEIGHT_EDUCATION = 0.24
+WEIGHT_RESEARCH = 0.32
+WEIGHT_EXPERIENCE = 0.29
 WEIGHT_SKILLS = 0.15
+
+
+def _clamp_score(value: float | int | None, default: float | None = None) -> float:
+    """Keep scores in [0, 10]; treat None as missing."""
+    if value is None:
+        return max(0.0, min(10.0, float(default))) if default is not None else 0.0
+    try:
+        return max(0.0, min(10.0, float(value)))
+    except (TypeError, ValueError):
+        return max(0.0, min(10.0, float(default))) if default is not None else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +132,7 @@ def _build_summary_prompt(
                 "cgpa": r.cgpa, "cgpa_scale": r.cgpa_scale,
                 "normalized_cgpa": r.normalized_cgpa,
                 "qs_ranking": r.institution_qs_ranking,
+                "the_ranking": r.institution_the_ranking,
             }
             for r in education_records
         ],
@@ -138,10 +150,13 @@ def _build_summary_prompt(
         "supervisions": len(supervisions),
         "skills_count": len(skills),
         "top_skills": [s.name for s in skills[:10]],
+        "target_job_description_excerpt": ((candidate.target_job_description or "")[:500] or None),
         "scores": {
             "education": assessment.education_strength_score if assessment else None,
             "experience": assessment.experience_strength_score if assessment else None,
-            "research": assessment.research_strength_score if assessment else None,
+            "research": research_strength_on_ten(assessment.research_strength_score) if assessment else None,
+            "skill_evidence": assessment.skill_alignment_score if assessment else None,
+            "jd_skill_match": getattr(assessment, "jd_alignment_score", None) if assessment else None,
         },
         "education_gaps": len(edu_gaps),
         "employment_gaps": len(emp_gaps),
@@ -189,21 +204,44 @@ def generate_candidate_summary(
     # ------------------------------------------------------------------
     # 1. Compute component scores
     # ------------------------------------------------------------------
-    edu_score = assessment.education_strength_score if assessment and assessment.education_strength_score else 5.0
-    exp_score = assessment.experience_strength_score if assessment and assessment.experience_strength_score else 5.0
-    research_score = assessment.research_strength_score if assessment and assessment.research_strength_score else \
-        _compute_research_score(len(journals), len(conferences), len(supervisions))
-    skill_score = assessment.skill_alignment_score if assessment and assessment.skill_alignment_score else \
-        _compute_skill_score(skills)
+    edu_score = (
+        _clamp_score(assessment.education_strength_score)
+        if assessment and assessment.education_strength_score is not None
+        else 5.0
+    )
+    exp_score = (
+        _clamp_score(assessment.experience_strength_score)
+        if assessment and assessment.experience_strength_score is not None
+        else 5.0
+    )
+    if assessment and assessment.research_strength_score is not None:
+        research_score = _clamp_score(research_strength_on_ten(assessment.research_strength_score))
+    else:
+        research_score = _compute_research_score(len(journals), len(conferences), len(supervisions))
+    evidence_skill = (
+        _clamp_score(assessment.skill_alignment_score)
+        if assessment and assessment.skill_alignment_score is not None
+        else _compute_skill_score(skills)
+    )
+    jd_part = getattr(assessment, "jd_alignment_score", None) if assessment else None
+    if jd_part is not None:
+        jd_part = _clamp_score(jd_part)
+    if jd_part is not None and (candidate.target_job_description or "").strip():
+        skill_component = round(min(10.0, float(evidence_skill) * 0.65 + float(jd_part) * 0.35), 2)
+    else:
+        skill_component = float(evidence_skill)
 
-    # Overall rank (weighted average)
+    skill_score = evidence_skill
+
+    # Overall rank (weighted average; skills slot uses JD blend when JD text + jd score exist)
     overall_rank = round(
         edu_score * WEIGHT_EDUCATION +
         research_score * WEIGHT_RESEARCH +
         exp_score * WEIGHT_EXPERIENCE +
-        skill_score * WEIGHT_SKILLS,
+        skill_component * WEIGHT_SKILLS,
         2,
     )
+    overall_rank = max(0.0, min(10.0, overall_rank))
 
     # ------------------------------------------------------------------
     # 2. Generate executive summary via LLM
@@ -256,8 +294,8 @@ def generate_candidate_summary(
     try:
         db.commit()
         logger.info(
-            "[SummaryGen] Done candidate=%d | overall_rank=%.2f | edu=%.1f | research=%.1f | exp=%.1f | skills=%.1f | llm=%s",
-            candidate_id, overall_rank, edu_score, research_score, exp_score, skill_score, llm_used,
+            "[SummaryGen] Done candidate=%d | overall_rank=%.2f | edu=%.1f | research=%.1f | exp=%.1f | skill_evidence=%.1f | skill_for_rank=%.2f | llm=%s",
+            candidate_id, overall_rank, edu_score, research_score, exp_score, skill_score, skill_component, llm_used,
         )
     except Exception as exc:
         db.rollback()
@@ -271,6 +309,7 @@ def generate_candidate_summary(
         "research_score": research_score,
         "experience_score": exp_score,
         "skill_score": skill_score,
+        "jd_alignment_score": jd_part,
         "summary": summary_text,
         "llm_used": llm_used,
     }

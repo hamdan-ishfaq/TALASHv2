@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
@@ -54,6 +55,33 @@ def _patent_format_ok(patent_no: str | None) -> bool:
     return bool(re.search(r"\d", patent_no))
 
 
+def _build_verification_links(db: Session, candidate_id: int) -> dict[str, Any]:
+    """Suggested public URLs for manual verification (books / patents)."""
+    books_out: list[dict[str, Any]] = []
+    for b in db.query(Book).filter_by(candidate_id=candidate_id).all():
+        digits = re.sub(r"[^0-9Xx]", "", b.isbn or "")
+        ol = f"https://openlibrary.org/isbn/{digits}.json" if len(digits) in (10, 13) else None
+        books_out.append(
+            {
+                "id": b.id,
+                "title": (b.title or "")[:120],
+                "open_library_json": ol,
+                "google_books_search": f"https://www.google.com/search?tbm=bks&q=isbn+{quote(digits)}" if digits else None,
+            }
+        )
+    patents_out: list[dict[str, Any]] = []
+    for p in db.query(Patent).filter_by(candidate_id=candidate_id).all():
+        q = (p.patent_no or p.title or "").strip()
+        patents_out.append(
+            {
+                "id": p.id,
+                "title": (p.title or "")[:120],
+                "google_patents_search": f"https://patents.google.com/?q={quote(q)}" if q else None,
+            }
+        )
+    return {"books": books_out[:25], "patents": patents_out[:25]}
+
+
 def run_local_ip_format_checks(db: Session, candidate_id: int) -> dict[str, Any]:
     """Non-network sanity checks for books/patents (format only)."""
     books = db.query(Book).filter_by(candidate_id=candidate_id).all()
@@ -86,13 +114,14 @@ def run_full_talash_analysis(db: Session, candidate_id: int) -> dict[str, Any]:
 
     run_education_analysis(db, candidate_id)
     run_experience_analysis(db, candidate_id)
-    run_research_analysis(db, candidate_id)
-    compute_and_persist_skill_alignment(db, candidate_id)
+    research_res = run_research_analysis(db, candidate_id)
+    skill_res = compute_and_persist_skill_alignment(db, candidate_id)
 
     topic = run_topic_analysis(db, candidate_id)
     collab = run_collaboration_analysis(db, candidate_id)
     run_supervision_analysis(db, candidate_id)
     ip_local = run_local_ip_format_checks(db, candidate_id)
+    verify_links = _build_verification_links(db, candidate_id)
 
     gen = generate_missing_information_requests(db, candidate_id, force=False)
     db.commit()
@@ -100,9 +129,23 @@ def run_full_talash_analysis(db: Session, candidate_id: int) -> dict[str, Any]:
     summary_result = generate_candidate_summary(db, candidate_id)
 
     out: dict[str, Any] = {
+        "research_audit": {
+            "grade": research_res.grade,
+            "final_score": research_res.final_score,
+            "normalized_score": research_res.normalized_score,
+            "enrichment_audit": research_res.enrichment_audit,
+            "warnings_head": (research_res.warnings or [])[:20],
+        },
         "topic_variability": topic.to_dict(),
         "collaboration": collab.to_dict(),
         "ip_format_checks": ip_local,
+        "verification_links": verify_links,
+        "skill_alignment": {
+            "evidence_score": skill_res.score,
+            "jd_score": skill_res.jd_score,
+            "jd_skills_matched": skill_res.jd_skills_matched,
+            "jd_publication_hits": skill_res.jd_publication_hits,
+        },
         "missing_info_modules": gen.generated_modules,
         "summary": {
             "overall_rank": summary_result.get("overall_rank"),

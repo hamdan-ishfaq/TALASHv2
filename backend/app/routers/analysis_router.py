@@ -28,11 +28,13 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, selectinload
 
 from app.db import SessionLocal
+from app.utils.scores import research_strength_on_ten
 from app.models.models import (
     Candidate,
     CandidateAssessment,
@@ -53,6 +55,22 @@ from app.services.summary_generator import generate_candidate_summary
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analysis", tags=["Module 2 — Analysis"])
+
+_DASHBOARD_OK_STATUSES = ("completed", "completed_with_errors")
+
+
+def _pipeline_healthy_from_json(raw: str | None) -> Optional[bool]:
+    if not raw:
+        return None
+    try:
+        aj = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(aj, dict):
+        return False
+    if aj.get("pipeline_error"):
+        return False
+    return bool(aj.get("pipeline"))
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +93,7 @@ class EducationAnalysisResponse(BaseModel):
     gaps_detected: int
     gaps_justified: int
     institutions_ranked: int
+    institutions_the_ranked: int = 0
     education_strength_score: Optional[float]
     progression_assessment: str
     specialization_consistency: str
@@ -170,8 +189,10 @@ class DashboardCandidate(BaseModel):
     experience_score: Optional[float]
     research_score: Optional[float]
     skill_score: Optional[float]
+    jd_alignment_score: Optional[float] = None
     overall_rank: Optional[float]
     summary: Optional[str]
+    analysis_healthy: Optional[bool] = None
     education_count: int
     experience_count: int
     journal_count: int
@@ -222,6 +243,9 @@ class SkillAlignmentResponse(BaseModel):
     skills_strong: int
     skills_partial: int
     score: float
+    jd_score: Optional[float] = None
+    jd_skills_matched: int = 0
+    jd_publication_hits: int = 0
 
 
 # ===========================================================================
@@ -280,6 +304,7 @@ def analyze_education(candidate_id: int, db: Session = Depends(get_db)):
         gaps_detected=result.gaps_detected,
         gaps_justified=result.gaps_justified,
         institutions_ranked=result.institutions_ranked,
+        institutions_the_ranked=result.institutions_the_ranked,
         education_strength_score=result.education_strength_score,
         progression_assessment=result.progression_assessment,
         specialization_consistency=result.specialization_consistency,
@@ -550,12 +575,13 @@ def get_summary(candidate_id: int, db: Session = Depends(get_db)):
         .first()
     )
 
+    rs = research_strength_on_ten(assessment.research_strength_score) if assessment else None
     return SummaryReadResponse(
         candidate_id=candidate_id,
         name=candidate.name,
         overall_rank=assessment.overall_rank if assessment else None,
         education_score=assessment.education_strength_score if assessment else None,
-        research_score=assessment.research_strength_score if assessment else None,
+        research_score=rs,
         experience_score=assessment.experience_strength_score if assessment else None,
         skill_score=assessment.skill_alignment_score if assessment else None,
         summary=candidate.summary,
@@ -594,7 +620,9 @@ def batch_full_pipeline(payload: BatchRequest, db: Session = Depends(get_db)):
                     except Exception:
                         prev = {}
                 merged = {**prev, "pipeline": pipe, "source": "api_batch_full_pipeline"}
+                merged.pop("pipeline_error", None)
                 cand.analysis_json = json.dumps(merged, default=str)
+                cand.status = "completed"
                 db.commit()
             results.append({
                 "candidate_id": cid,
@@ -608,6 +636,19 @@ def batch_full_pipeline(payload: BatchRequest, db: Session = Depends(get_db)):
             succeeded += 1
         except Exception as exc:
             logger.exception("Full pipeline failed for candidate %d", cid)
+            cand = db.query(Candidate).filter_by(id=cid).first()
+            if cand:
+                prev_e: dict = {}
+                if cand.analysis_json:
+                    try:
+                        prev_e = json.loads(cand.analysis_json)
+                    except Exception:
+                        prev_e = {}
+                merged_e = {**(prev_e if isinstance(prev_e, dict) else {}), "pipeline_error": str(exc)}
+                merged_e.pop("pipeline", None)
+                cand.analysis_json = json.dumps(merged_e, default=str)
+                cand.status = "completed_with_errors"
+                db.commit()
             results.append({"candidate_id": cid, "status": "error", "detail": str(exc)})
             failed += 1
 
@@ -644,12 +685,26 @@ def full_pipeline(candidate_id: int, db: Session = Depends(get_db)):
             except Exception:
                 prev = {}
         if isinstance(prev, dict) and "extraction_counts" in prev:
-            candidate.analysis_json = json.dumps({**prev, "pipeline": pipe}, default=str)
+            merged = {**prev, "pipeline": pipe}
+            merged.pop("pipeline_error", None)
+            candidate.analysis_json = json.dumps(merged, default=str)
         else:
             candidate.analysis_json = json.dumps({"pipeline": pipe, "source": "api_full_pipeline"}, default=str)
+        candidate.status = "completed"
         db.commit()
     except Exception as exc:
         logger.exception("Full pipeline failed for candidate %d: %s", candidate_id, exc)
+        prev = {}
+        if candidate.analysis_json:
+            try:
+                prev = json.loads(candidate.analysis_json)
+            except Exception:
+                prev = {}
+        merged: dict = {**(prev if isinstance(prev, dict) else {}), "pipeline_error": str(exc)}
+        merged.pop("pipeline", None)
+        candidate.analysis_json = json.dumps(merged, default=str)
+        candidate.status = "completed_with_errors"
+        db.commit()
         raise HTTPException(status_code=500, detail=str(exc))
 
     return SummaryResponse(
@@ -670,24 +725,57 @@ def full_pipeline(candidate_id: int, db: Session = Depends(get_db)):
 @router.get(
     "/dashboard",
     response_model=DashboardResponse,
-    summary="Get successfully processed candidates for dashboard (status=completed only)",
+    summary="Dashboard: completed and completed_with_errors by default; optional include_failed for all statuses",
 )
-def get_dashboard(db: Session = Depends(get_db)):
-    candidates = db.query(Candidate).filter(Candidate.status == "completed").all()
+def get_dashboard(
+    include_failed: bool = Query(False, description="If true, include queued/processing/failed candidates"),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Candidate)
+    if not include_failed:
+        q = q.filter(Candidate.status.in_(_DASHBOARD_OK_STATUSES))
+    candidates = (
+        q.options(
+            selectinload(Candidate.education_records),
+            selectinload(Candidate.work_experiences),
+            selectinload(Candidate.journal_publications),
+            selectinload(Candidate.conference_publications),
+            selectinload(Candidate.skills),
+            selectinload(Candidate.supervision_records),
+        )
+        .order_by(Candidate.updated_at.desc())
+        .all()
+    )
+
+    if not candidates:
+        return DashboardResponse(total_candidates=0, candidates=[])
+
+    cand_ids = [c.id for c in candidates]
+    missing_rows = (
+        db.query(MissingInformationRequest.candidate_id, func.count(MissingInformationRequest.id))
+        .filter(MissingInformationRequest.candidate_id.in_(cand_ids))
+        .group_by(MissingInformationRequest.candidate_id)
+        .all()
+    )
+    missing_map = {row[0]: int(row[1]) for row in missing_rows}
+
+    assessments = (
+        db.query(CandidateAssessment)
+        .filter(CandidateAssessment.candidate_id.in_(cand_ids))
+        .order_by(CandidateAssessment.generated_at.desc())
+        .all()
+    )
+    latest_assess: dict[int, CandidateAssessment] = {}
+    for a in assessments:
+        if a.candidate_id not in latest_assess:
+            latest_assess[a.candidate_id] = a
 
     dashboard_candidates = []
     for cand in candidates:
-        assessment = (
-            db.query(CandidateAssessment)
-            .filter_by(candidate_id=cand.id)
-            .order_by(CandidateAssessment.generated_at.desc())
-            .first()
-        )
-        missing_count = (
-            db.query(MissingInformationRequest)
-            .filter_by(candidate_id=cand.id)
-            .count()
-        )
+        assessment = latest_assess.get(cand.id)
+        rscore = None
+        if assessment and assessment.research_strength_score is not None:
+            rscore = research_strength_on_ten(assessment.research_strength_score)
 
         dashboard_candidates.append(DashboardCandidate(
             candidate_id=cand.id,
@@ -696,17 +784,19 @@ def get_dashboard(db: Session = Depends(get_db)):
             status=cand.status,
             education_score=assessment.education_strength_score if assessment else None,
             experience_score=assessment.experience_strength_score if assessment else None,
-            research_score=assessment.research_strength_score if assessment else None,
+            research_score=rscore,
             skill_score=assessment.skill_alignment_score if assessment else None,
+            jd_alignment_score=getattr(assessment, "jd_alignment_score", None) if assessment else None,
             overall_rank=assessment.overall_rank if assessment else None,
             summary=cand.summary,
+            analysis_healthy=_pipeline_healthy_from_json(cand.analysis_json),
             education_count=len(cand.education_records),
             experience_count=len(cand.work_experiences),
             journal_count=len(cand.journal_publications),
             conference_count=len(cand.conference_publications),
             skill_count=len(cand.skills),
             supervision_count=len(cand.supervision_records),
-            missing_info_count=missing_count,
+            missing_info_count=missing_map.get(cand.id, 0),
         ))
 
     return DashboardResponse(
@@ -721,9 +811,9 @@ def get_dashboard(db: Session = Depends(get_db)):
     summary="Extra: quantifiable ordering of candidates by overall_rank (higher first)",
 )
 def get_candidate_ranking(db: Session = Depends(get_db)):
-    """Bonus-style ranking: completed candidates only, by latest overall_rank descending."""
+    """Bonus-style ranking: completed (+ completed_with_errors), by latest overall_rank descending."""
     rows: list[tuple[Candidate, Optional[CandidateAssessment]]] = []
-    for cand in db.query(Candidate).filter(Candidate.status == "completed").all():
+    for cand in db.query(Candidate).filter(Candidate.status.in_(_DASHBOARD_OK_STATUSES)).all():
         assessment = (
             db.query(CandidateAssessment)
             .filter_by(candidate_id=cand.id)
@@ -740,6 +830,7 @@ def get_candidate_ranking(db: Session = Depends(get_db)):
     rows.sort(key=sort_key, reverse=True)
     out: list[RankingRow] = []
     for i, (cand, a) in enumerate(rows, start=1):
+        rs = research_strength_on_ten(a.research_strength_score) if a and a.research_strength_score is not None else None
         out.append(
             RankingRow(
                 rank=i,
@@ -747,7 +838,7 @@ def get_candidate_ranking(db: Session = Depends(get_db)):
                 name=cand.name,
                 overall_rank=a.overall_rank if a else None,
                 education_score=a.education_strength_score if a else None,
-                research_score=a.research_strength_score if a else None,
+                research_score=rs,
                 experience_score=a.experience_strength_score if a else None,
                 skill_score=a.skill_alignment_score if a else None,
             )
@@ -831,6 +922,9 @@ def recompute_skill_alignment(candidate_id: int, db: Session = Depends(get_db)):
         skills_strong=result.skills_strong,
         skills_partial=result.skills_partial,
         score=result.score,
+        jd_score=result.jd_score,
+        jd_skills_matched=result.jd_skills_matched,
+        jd_publication_hits=result.jd_publication_hits,
     )
 
 
@@ -902,11 +996,12 @@ def get_research_analysis(candidate_id: int, db: Session = Depends(get_db)):
             status_code=404,
             detail="No research analysis found — run POST /analysis/research/{id} first",
         )
+    rs = research_strength_on_ten(assessment.research_strength_score) or 0.0
     return ResearchAnalysisResponse(
         candidate_id=candidate_id,
         grade="CACHED",
-        final_score=assessment.research_strength_score or 0.0,
-        normalized_score=assessment.research_strength_score or 0.0,
+        final_score=rs,
+        normalized_score=rs,
         base_score=0.0,
         components={},
         bonus_breakdown={},

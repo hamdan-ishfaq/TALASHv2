@@ -29,6 +29,9 @@ OPENROUTER_INTER_REQUEST_DELAY = int(
     os.getenv("OPENROUTER_INTER_REQUEST_DELAY", "5")
 )
 
+# Cap CV characters sent to the LLM (large PDFs slow requests and risk truncation errors).
+TALASH_MAX_CV_CHARS = int(os.getenv("TALASH_MAX_CV_CHARS", "120000"))
+
 # ---------------------------------------------------------------------------
 # Pre-validation normaliser – coerces null → [] for known list-typed fields
 # in raw LLM JSON *before* Pydantic sees it.  Belt-and-suspenders with the
@@ -113,6 +116,86 @@ class CVExtractorService:
             cleaned_lines.append(line)
         sanitized = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
         return sanitized
+
+    @staticmethod
+    def _truncate_cv_text(cv_text: str, max_chars: int | None = None) -> str:
+        """Keep head + tail so contact lines at the top and publications at the end stay visible."""
+        limit = max_chars if max_chars is not None else TALASH_MAX_CV_CHARS
+        if limit <= 0 or len(cv_text) <= limit:
+            return cv_text
+        head = max(8_000, int(limit * 0.62))
+        tail = limit - head - 120
+        if tail < 4_000:
+            return cv_text[:limit] + "\n\n[CV text truncated for model context]\n"
+        mid = "\n\n...[middle of CV omitted for size / token limits]...\n\n"
+        return cv_text[:head] + mid + cv_text[-tail:]
+
+    @staticmethod
+    def _journal_pub_key(j: Any) -> tuple:
+        doi = (getattr(j, "doi", None) or "").strip().lower()
+        if doi and len(doi) > 6:
+            return ("doi", doi)
+        title = re.sub(r"\s+", " ", (getattr(j, "title", None) or "").lower()).strip()[:240]
+        jn = (getattr(j, "journal_name", None) or "").lower().strip()[:120]
+        return ("t", title, getattr(j, "year", None), jn)
+
+    @staticmethod
+    def _conference_pub_key(c: Any) -> tuple:
+        doi = (getattr(c, "doi", None) or "").strip().lower()
+        if doi and len(doi) > 6:
+            return ("doi", doi)
+        title = re.sub(r"\s+", " ", (getattr(c, "title", None) or "").lower()).strip()[:240]
+        cn = (getattr(c, "conference_name", None) or "").lower().strip()[:120]
+        return ("t", title, getattr(c, "year", None), cn)
+
+    @staticmethod
+    def _dedupe_journals(items: list[Any]) -> list[Any]:
+        seen: set[tuple] = set()
+        out: list[Any] = []
+        for j in items:
+            k = CVExtractorService._journal_pub_key(j)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(j)
+        return out
+
+    @staticmethod
+    def _dedupe_conferences(items: list[Any]) -> list[Any]:
+        seen: set[tuple] = set()
+        out: list[Any] = []
+        for c in items:
+            k = CVExtractorService._conference_pub_key(c)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(c)
+        return out
+
+    @staticmethod
+    def _dedupe_skills(items: list[Any]) -> list[Any]:
+        seen: set[str] = set()
+        out: list[Any] = []
+        for s in items:
+            k = re.sub(r"\s+", " ", (getattr(s, "name", None) or "").lower()).strip()[:160]
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(s)
+        return out
+
+    @staticmethod
+    def _dedupe_patents(items: list[Any]) -> list[Any]:
+        seen: set[tuple] = set()
+        out: list[Any] = []
+        for p in items:
+            pn = (getattr(p, "patent_no", None) or "").strip().lower()
+            key: tuple = ("n", pn) if pn else ("t", (getattr(p, "title", None) or "").lower().strip()[:200])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
 
     @staticmethod
     def _extract_contact_hints(cv_text: str) -> dict[str, str | None]:
@@ -274,10 +357,23 @@ class CVExtractorService:
             )
             return None
 
-    def extract_section(self, cv_text: str, section: str) -> BaseModel:
-        """Run a focused extraction for one section."""
+    def extract_section(
+        self,
+        cv_text: str,
+        section: str,
+        *,
+        contact_source: str | None = None,
+    ) -> BaseModel:
+        """Run a focused extraction for one section.
+
+        ``contact_source`` (optional) is the full sanitized CV used for regex contact hints
+        while ``cv_text`` is what is sent to the model (may be truncated for very large PDFs).
+        """
         sanitized_text = self._sanitize_cv_text(cv_text)
-        contact_hints = self._extract_contact_hints(sanitized_text)
+        contact_src = (
+            self._sanitize_cv_text(contact_source) if contact_source is not None else sanitized_text
+        )
+        contact_hints = self._extract_contact_hints(contact_src)
         base_user_prompt = (
             "Extract only what is explicitly present in the sanitized CV text. "
             "Do not hallucinate or infer unsupported facts. "
@@ -364,9 +460,15 @@ class CVExtractorService:
 
         Each call is separated by OPENROUTER_INTER_REQUEST_DELAY seconds.
         """
-        sanitized_text = self._sanitize_cv_text(cv_text)
-        contact_hints = self._extract_contact_hints(sanitized_text)
-
+        sanitized_full = self._sanitize_cv_text(cv_text)
+        llm_text = self._truncate_cv_text(sanitized_full)
+        if len(llm_text) < len(sanitized_full):
+            logger.info(
+                "[EXTRACTOR] CV length %d → truncated to %d chars for LLM (TALASH_MAX_CV_CHARS=%s)",
+                len(sanitized_full),
+                len(llm_text),
+                os.getenv("TALASH_MAX_CV_CHARS", "120000"),
+            )
         # Explicitly refresh routed client for each extraction run.
         self.client, self.model = llm_router.get_structured_client()
 
@@ -377,7 +479,7 @@ class CVExtractorService:
         )
 
         # Section 1: Core
-        core = self.extract_section(sanitized_text, "core")
+        core = self.extract_section(llm_text, "core", contact_source=sanitized_full)
 
         # Rate-limit delay before next call
         if OPENROUTER_INTER_REQUEST_DELAY > 0:
@@ -388,7 +490,7 @@ class CVExtractorService:
             time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
 
         # Section 2: Academic
-        academic = self.extract_section(sanitized_text, "academic")
+        academic = self.extract_section(llm_text, "academic", contact_source=sanitized_full)
 
         # Rate-limit delay before next call
         if OPENROUTER_INTER_REQUEST_DELAY > 0:
@@ -399,9 +501,9 @@ class CVExtractorService:
             time.sleep(OPENROUTER_INTER_REQUEST_DELAY)
 
         # Section 3: Skills & IP
-        skills_and_ip = self.extract_section(sanitized_text, "skills")
+        skills_and_ip = self.extract_section(llm_text, "skills", contact_source=sanitized_full)
 
-        assembled = self.aggregate_sections(cv_text, core, academic, skills_and_ip)
+        assembled = self.aggregate_sections(sanitized_full, core, academic, skills_and_ip)
 
         logger.info(
             "Sequential extraction complete | name=%s | edu=%d | exp=%d | journals=%d | conf=%d | supervision=%d | books=%d | patents=%d | skills=%d",
@@ -438,6 +540,11 @@ class CVExtractorService:
             if publication_bundle.conference is not None:
                 conference_publications.append(publication_bundle.conference)
 
+        journal_publications = self._dedupe_journals(journal_publications)
+        conference_publications = self._dedupe_conferences(conference_publications)
+        patents_deduped = self._dedupe_patents(skills_and_ip.patents)
+        skills_deduped = self._dedupe_skills(skills_and_ip.skills)
+
         extracted_name = core.name or self._guess_name_from_text(sanitized_text)
         if self._is_malformed_name(extracted_name):
             logger.warning(
@@ -460,8 +567,8 @@ class CVExtractorService:
             conference_publications=conference_publications,
             supervision_records=academic.supervision,
             books=academic.books,
-            patents=skills_and_ip.patents,
-            skills=skills_and_ip.skills,
+            patents=patents_deduped,
+            skills=skills_deduped,
             career_breaks=[],
         )
         assembled.llm_model_name = self.model

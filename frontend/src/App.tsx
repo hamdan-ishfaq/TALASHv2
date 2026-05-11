@@ -22,16 +22,19 @@ const App: React.FC = () => {
   // Upload State
   const [dragOver, setDragOver] = useState(false);
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
+  const [includeFailed, setIncludeFailed] = useState(false);
 
   const fetchDashboard = useCallback(async (isPolling = false) => {
     if (!isPolling) setLoading(true); 
     setError(null);
     try {
-      const r = await axios.get(`${API}/analysis/dashboard`);
+      const r = await axios.get(`${API}/analysis/dashboard`, {
+        params: { include_failed: includeFailed ? 1 : 0 },
+      });
       setCandidates(r.data.candidates || []);
     } catch (e: any) { setError(e.response?.data?.detail || 'Failed to load dashboard'); }
     if (!isPolling) setLoading(false);
-  }, []);
+  }, [includeFailed]);
 
   const fetchDetail = useCallback(async (id: number) => {
     setLoading(true); setError(null);
@@ -104,6 +107,8 @@ const App: React.FC = () => {
               <DashboardView 
                 candidates={candidates}
                 onSelectCandidate={handleSelectCandidate}
+                includeFailed={includeFailed}
+                onIncludeFailedChange={setIncludeFailed}
               />
             )}
 
@@ -112,6 +117,8 @@ const App: React.FC = () => {
                 detail={detail}
                 missingInfo={missingInfo}
                 onBack={() => setView('dashboard')}
+                apiBase={API}
+                onRefetch={() => selectedId != null && fetchDetail(selectedId)}
               />
             )}
           </>

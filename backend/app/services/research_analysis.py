@@ -19,7 +19,6 @@ Scoring breakdown (v2.0):
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -39,9 +38,16 @@ from app.models.models import (
     Patent,
     SupervisionRecord,
 )
+from app.utils.scores import research_strength_for_persist
+
 from app.services.scimago_lookup import ScimagoLookup
 from app.services.core_lookup import CoreLookup
-from app.services.research_enrichment import enrich_all_publications, detect_conference_indexing
+from app.services.research_enrichment import (
+    _is_generic_venue,
+    detect_conference_indexing,
+    enrich_all_publications,
+)
+from app.services.sync_async import run_coro_sync
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,7 @@ class ResearchAnalysisResult:
     counts: dict
     warnings: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
+    enrichment_audit: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +99,15 @@ def _norm_role(role_str: str) -> str:
     return mapping.get(role, "unknown")
 
 
-def _extract_ordinal(venue: str) -> Optional[str]:
-    m = re.search(r"\b(\d+)\s*(st|nd|rd|th)\b", str(venue), re.I)
-    return f"{m.group(1)}{m.group(2).lower()}" if m else None
+def _extract_ordinal(*text_parts: str) -> Optional[str]:
+    """Parse edition like '13th Annual' or '28th IEEE' from venue and/or title."""
+    blob = " ".join(p for p in text_parts if p).strip()
+    if not blob:
+        return None
+    m = re.search(r"\b(\d{1,3})\s*(st|nd|rd|th)\b", blob, re.I)
+    if m:
+        return f"{m.group(1)}{m.group(2).lower()}"
+    return None
 
 
 def _build_maturity(ordinal: Optional[str], earliest_year: Optional[int]) -> dict:
@@ -131,22 +144,50 @@ def _score_publication_quality(j_pubs: list[dict], c_pubs: list[dict]) -> dict:
     reasons, warnings, scores = [], [], []
 
     for p in j_pubs:
-        q   = str(p.get("quartile") or "").strip().upper()
-        q   = q if q in ("Q1", "Q2", "Q3", "Q4") else None
+        q = str(p.get("quartile") or "").strip().upper()
+        q = q if q in ("Q1", "Q2", "Q3", "Q4") else None
         wos = p.get("wos_indexed") or False
-        sc  = p.get("scopus_indexed") or p.get("oa_scopus_proxy") or False
+        sc = p.get("scopus_indexed") or p.get("oa_scopus_proxy") or False
         title = (p.get("title") or "Untitled")[:55]
+        tier = str(p.get("openalex_journal_tier") or "weak").lower()
+        doaj = bool(p.get("doaj_indexed"))
 
-        if   q == "Q1" and wos:         pts, note = 8.0, "Q1+WoS"
-        elif q == "Q1" and sc:          pts, note = 7.0, "Q1+Scopus"
-        elif q == "Q1":                 pts, note = 5.5, "Q1 (indexing unverified)"
-        elif q == "Q2" and (wos or sc): pts, note = 5.0, "Q2+indexed"
-        elif q == "Q2":                 pts, note = 4.0, "Q2 (indexing unverified)"
-        elif q == "Q3" and (wos or sc): pts, note = 3.0, "Q3+indexed"
-        elif q == "Q3":                 pts, note = 2.0, "Q3 (indexing unverified)"
-        elif q == "Q4":                 pts, note = 1.0, "Q4"
-        elif p.get("is_legitimate"):    pts, note = 1.5, "Unranked but verified"
-        else:                           pts, note = 0.5, "Unranked/unverified"
+        if q == "Q1" and wos:
+            pts, note = 8.0, "Q1+WoS"
+        elif q == "Q1" and sc:
+            pts, note = 7.0, "Q1+Scopus"
+        elif q == "Q1":
+            pts, note = 5.5, "Q1 (indexing unverified)"
+        elif q == "Q2" and (wos or sc):
+            pts, note = 5.0, "Q2+indexed"
+        elif q == "Q2":
+            pts, note = 4.0, "Q2 (indexing unverified)"
+        elif q == "Q3" and (wos or sc):
+            pts, note = 3.0, "Q3+indexed"
+        elif q == "Q3":
+            pts, note = 2.0, "Q3 (indexing unverified)"
+        elif q == "Q4":
+            pts, note = 1.0, "Q4"
+        elif doaj and tier == "strong":
+            pts, note = 3.0, "DOAJ + strong OpenAlex venue (no Scimago quartile)"
+        elif doaj and tier in ("medium", "modest"):
+            pts, note = 2.5, "DOAJ + moderate OpenAlex venue"
+        elif doaj:
+            pts, note = 2.1, "DOAJ listed journal"
+        elif tier == "strong" and (wos or sc):
+            pts, note = 3.2, "Strong OpenAlex venue + indexing signal"
+        elif tier == "strong":
+            pts, note = 2.7, "Strong OpenAlex venue (Scimago quartile unavailable)"
+        elif tier == "medium" and (wos or sc):
+            pts, note = 2.4, "Medium OpenAlex venue + indexing"
+        elif tier == "medium":
+            pts, note = 2.0, "Medium OpenAlex venue"
+        elif tier == "modest":
+            pts, note = 1.3, "Modest OpenAlex venue"
+        elif p.get("is_legitimate"):
+            pts, note = 1.5, "Unranked but verified (Crossref/ISSN)"
+        else:
+            pts, note = 0.5, "Unranked/unverified"
 
         scores.append(pts)
         reasons.append(f"Journal '{title}': {pts}pts [{note}]")
@@ -366,6 +407,92 @@ def _build_recommendations(components: dict, j_pubs: list, c_pubs: list) -> list
 # ---------------------------------------------------------------------------
 # DB upsert helper
 # ---------------------------------------------------------------------------
+def _canonical_authorship_role(raw: str | None) -> Optional[str]:
+    if not raw or str(raw).strip().lower() in ("unknown", ""):
+        return None
+    key = str(raw).strip().lower()
+    mapping = {
+        "first_author": "First Author",
+        "corresponding_author": "Corresponding Author",
+        "first_and_corresponding": "Both First and Corresponding Author",
+        "co_author": "Other Co-Author",
+    }
+    return mapping.get(key)
+
+
+def _persist_enriched_publications(db: Session, j_pubs: list[dict], c_pubs: list[dict]) -> None:
+    """Persist recovered metadata to ORM rows (dashboard + CSV exports stay aligned with scoring)."""
+    for p in j_pubs:
+        jid = p.get("id")
+        if not jid:
+            continue
+        row = db.query(JournalPublication).filter_by(id=jid).first()
+        if not row:
+            continue
+        if p.get("issn"):
+            row.issn = p["issn"]
+        if p.get("doi"):
+            row.doi = p["doi"]
+        ven = (p.get("venue") or "").strip()
+        if ven and (_is_generic_venue(row.journal_name or "") or not (row.journal_name or "").strip()):
+            row.journal_name = ven
+        yr = p.get("year")
+        if yr is not None and row.year is None:
+            try:
+                row.year = int(yr)
+            except (TypeError, ValueError):
+                pass
+        if p.get("quartile"):
+            row.quartile = p["quartile"]
+        if p.get("impact_factor") is not None:
+            try:
+                row.impact_factor = float(p["impact_factor"])
+            except (TypeError, ValueError):
+                pass
+        if p.get("wos_indexed") is not None:
+            row.wos_indexed = bool(p.get("wos_indexed"))
+        sc_val = p.get("scopus_indexed")
+        if sc_val is None:
+            sc_val = p.get("oa_scopus_proxy")
+        if sc_val is not None:
+            row.scopus_indexed = bool(sc_val)
+        role = _canonical_authorship_role(p.get("authorship_role_api"))
+        if role:
+            row.authorship_role = role
+
+    for p in c_pubs:
+        cid_pub = p.get("id")
+        if not cid_pub:
+            continue
+        row = db.query(ConferencePublication).filter_by(id=cid_pub).first()
+        if not row:
+            continue
+        if p.get("doi"):
+            row.doi = p["doi"]
+        cname = (p.get("conference_name") or p.get("venue") or "").strip()
+        if cname and (_is_generic_venue(row.conference_name or "") or not (row.conference_name or "").strip()):
+            row.conference_name = cname
+        if p.get("core_ranking"):
+            row.core_ranking = p["core_ranking"]
+        if p.get("is_a_star") is not None:
+            row.is_a_star = bool(p["is_a_star"])
+        pub = (p.get("publisher") or "").strip()
+        if pub and not (row.publisher or "").strip():
+            row.publisher = pub
+        idx = p.get("proc_indexed_in")
+        if isinstance(idx, list) and idx:
+            row.indexed_in = ", ".join(str(x) for x in idx if x)
+        elif isinstance(idx, str) and idx.strip() and not (row.indexed_in or "").strip():
+            row.indexed_in = idx.strip()
+        mat = p.get("maturity") or {}
+        ord_ed = mat.get("ordinal_edition")
+        if ord_ed and not (row.conference_series or "").strip():
+            row.conference_series = f"{ord_ed} edition (parsed from venue/title)"
+        role = _canonical_authorship_role(p.get("authorship_role_api"))
+        if role:
+            row.authorship_role = role
+
+
 def _upsert_research_score(db: Session, candidate_id: int, result: ResearchAnalysisResult) -> None:
     """Write research score into CandidateAssessment (upsert pattern)."""
     existing = (
@@ -386,17 +513,19 @@ def _upsert_research_score(db: Session, candidate_id: int, result: ResearchAnaly
         "counts":           result.counts,
         "warnings":         result.warnings,
         "recommendations":  result.recommendations,
+        "enrichment_audit": result.enrichment_audit,
     })
 
+    rs_10 = research_strength_for_persist(result.normalized_score)
     if existing:
-        existing.research_strength_score = result.normalized_score
+        existing.research_strength_score = rs_10
         existing.assessment_version       = "m2_research_v2"
         # Store full detail in analysis_json on the candidate row (done in main fn)
     else:
         db.add(CandidateAssessment(
             candidate_id=candidate_id,
             assessment_version="m2_research_v2",
-            research_strength_score=result.normalized_score,
+            research_strength_score=rs_10,
             overall_summary=(
                 f"Research score: {result.grade} ({result.final_score:.1f}/110). "
                 f"{len(result.warnings)} warning(s)."
@@ -410,7 +539,7 @@ def _upsert_research_score(db: Session, candidate_id: int, result: ResearchAnaly
 def run_research_analysis(db: Session, candidate_id: int) -> ResearchAnalysisResult:
     """
     Entry point called by the router.
-    Sync wrapper — runs async enrichment via asyncio.run().
+    Sync wrapper — runs async enrichment via a dedicated event loop (Celery-safe).
     """
     logger.info("[ResearchAnalysis] Starting for candidate_id=%d", candidate_id)
 
@@ -454,52 +583,72 @@ def run_research_analysis(db: Session, candidate_id: int) -> ResearchAnalysisRes
                     for p in patent_rows]
 
     # 4. Async enrichment (title recovery + API calls)
+    enrichment_audit: dict = {"skipped": False, "warnings": [], "errors": []}
     if j_pubs or c_pubs:
         logger.info("[ResearchAnalysis] Enriching %d journals + %d conferences...",
                     len(j_pubs), len(c_pubs))
         try:
-            j_pubs, c_pubs = asyncio.run(
+            j_pubs, c_pubs, enrich_audit = run_coro_sync(
                 enrich_all_publications(j_pubs, c_pubs, candidate_name)
             )
+            enrichment_audit.update(enrich_audit)
         except Exception as exc:
             logger.error("[ResearchAnalysis] Enrichment failed: %s — scoring with raw data", exc)
+            enrichment_audit["warnings"].append(f"Enrichment runner crashed: {exc!s}")
 
     # 5. Apply local dataset lookups AFTER enrichment (ISSN/venue now recovered)
     scimago = ScimagoLookup.get()
     core    = CoreLookup.get()
 
     for p in j_pubs:
-        issn = p.get("issn") or ""
-        if issn and not p.get("quartile"):
-            q = scimago.lookup_quartile(issn)
-            if q:
-                p["quartile"] = q
-        # Determine is_legitimate
+        issn = (p.get("issn") or "").strip()
+        cv_q = (str(p.get("quartile") or "").strip().upper() or None)
+        if issn:
+            q_cat = scimago.lookup_quartile(issn)
+            if q_cat:
+                if cv_q and cv_q != str(q_cat).strip().upper():
+                    enrichment_audit["warnings"].append(
+                        f"Journal quartile for '{(p.get('title') or '')[:50]}' set from Scimago ISSN ({q_cat}); "
+                        f"CV/extraction had {cv_q}."
+                    )
+                p["quartile"] = q_cat
+                p["quartile_source"] = "scimago_issn"
+            elif cv_q:
+                p["quartile_source"] = "cv_unverified"
+                enrichment_audit["warnings"].append(
+                    f"ISSN not found in Scimago catalog — quartile {cv_q} for "
+                    f"'{(p.get('title') or '')[:50]}' is not externally verified."
+                )
+        elif cv_q:
+            p["quartile_source"] = "cv_unverified"
+            enrichment_audit["warnings"].append(
+                f"No ISSN recovered — quartile {cv_q} for '{(p.get('title') or '')[:50]}' is not externally verified."
+            )
         p["is_legitimate"] = bool(p.get("quartile") or p.get("crossref_found") or p.get("oa_scopus_proxy"))
 
     for p in c_pubs:
         venue = p.get("conference_name") or ""
-        # CORE rank from local CSV if not already set from DB
-        if not p.get("core_ranking") or p.get("core_ranking", "").lower() in ("unranked", "none", ""):
+        title = p.get("title") or ""
+        if not p.get("core_ranking") or str(p.get("core_ranking", "")).lower() in ("unranked", "none", ""):
             rank = core.lookup_rank(venue)
             if rank:
                 p["core_ranking"] = rank
-                p["is_a_star"]    = rank.strip().upper() == "A*"
-        # Publisher/indexing detection
+                p["is_a_star"] = rank.strip().upper() == "A*"
         indexing = detect_conference_indexing(
             venue,
             p.get("publisher_cr", ""),
             p.get("publisher", ""),
         )
         p.update({
-            "publisher":           p.get("publisher") or indexing["publisher"],
-            "proc_indexed_in":     indexing["proc_indexed_in"],
+            "publisher": p.get("publisher") or indexing["publisher"],
+            "proc_indexed_in": indexing["proc_indexed_in"],
             "proc_scopus_indexed": indexing["proc_scopus_indexed"],
         })
-        # Conference maturity
-        ordinal  = _extract_ordinal(venue)
+        ordinal = _extract_ordinal(venue, title) or _extract_ordinal(p.get("venue") or "")
         maturity = _build_maturity(ordinal, p.get("earliest_conf_year"))
         p["maturity"] = maturity
+
+    _persist_enriched_publications(db, j_pubs, c_pubs)
 
     # 6. Score
     pub_q  = _score_publication_quality(j_pubs, c_pubs)
@@ -534,6 +683,7 @@ def run_research_analysis(db: Session, candidate_id: int) -> ResearchAnalysisRes
     all_warnings: list[str] = []
     for comp in [pub_q, auth_s, collab, conf_m, sup_s]:
         all_warnings.extend(comp.get("warnings", []))
+    all_warnings.extend(enrichment_audit.get("warnings", []))
 
     components = {
         "publication_quality":    pub_q,
@@ -568,6 +718,7 @@ def run_research_analysis(db: Session, candidate_id: int) -> ResearchAnalysisRes
         },
         warnings=all_warnings,
         recommendations=_build_recommendations(components, j_pubs, c_pubs),
+        enrichment_audit=enrichment_audit,
     )
 
     # 7. Write to DB (upsert)

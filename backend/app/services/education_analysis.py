@@ -40,6 +40,7 @@ from app.models.models import (
 )
 from app.services.llm_analysis import analysis_llm_call
 from app.services.qs_lookup import QSRankingLookup
+from app.services.the_lookup import THERankingLookup
 
 logger = logging.getLogger(__name__)
 
@@ -270,9 +271,11 @@ def _build_education_prompt(
     gaps: list[_GapInfo],
     gap_justifications: dict[int, tuple[bool, str]],
     qs_results: dict[str, dict],
+    the_results: dict[str, dict],
 ) -> str:
     edu_list = []
     for r in sorted(records, key=lambda x: _stage_key(x.stage)):
+        inst_key = r.institution or ""
         edu_list.append({
             "stage":            r.stage,
             "degree":           r.degree_title,
@@ -284,7 +287,9 @@ def _build_education_prompt(
             "cgpa_scale":       r.cgpa_scale,
             "marks_percentage": r.marks_percentage,
             "normalized_cgpa":  r.normalized_cgpa,
-            "qs_rank_2026":     qs_results.get(r.institution or "", {}).get("rank_2026"),
+            "qs_rank_2026":     qs_results.get(inst_key, {}).get("rank_2026"),
+            "the_rank":         the_results.get(inst_key, {}).get("rank")
+            or the_results.get(inst_key, {}).get("rank_int"),
         })
 
     gap_list = []
@@ -347,6 +352,38 @@ def _generate_missing_info_email(
 # ---------------------------------------------------------------------------
 # DB write helpers
 # ---------------------------------------------------------------------------
+def _upsert_institution_ranking_the(
+    db: Session,
+    candidate_id: int,
+    institution_name: str,
+    the_result: dict,
+) -> None:
+    existing = (
+        db.query(InstitutionRanking)
+        .filter_by(candidate_id=candidate_id, institution_name=institution_name, source="THE")
+        .first()
+    )
+    rv = the_result.get("rank") or the_result.get("rank_int")
+    if existing:
+        existing.rank_value = str(rv) if rv is not None else None
+        existing.rank_band = str(rv) if rv is not None else None
+        existing.country = the_result.get("country")
+        existing.source_year = 2026
+    else:
+        db.add(
+            InstitutionRanking(
+                candidate_id=candidate_id,
+                institution_name=institution_name,
+                source="THE",
+                source_year=2026,
+                rank_value=str(rv) if rv is not None else None,
+                rank_band=str(rv) if rv is not None else None,
+                country=the_result.get("country"),
+                url="https://www.timeshighereducation.com/world-university-rankings",
+            )
+        )
+
+
 def _upsert_institution_ranking(
     db: Session,
     candidate_id: int,
@@ -486,6 +523,7 @@ class EducationAnalysisResult:
     missing_fields: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
     llm_used: bool = False
+    institutions_the_ranked: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +561,7 @@ def run_education_analysis(
             gaps_detected=0,
             gaps_justified=0,
             institutions_ranked=0,
+            institutions_the_ranked=0,
             education_strength_score=None,
             progression_assessment="Insufficient Data",
             specialization_consistency="N/A",
@@ -568,6 +607,34 @@ def run_education_analysis(
             _upsert_institution_ranking(db, candidate_id, inst, result)
 
     # ------------------------------------------------------------------
+    # 3b. THE ranking lookup (optional local XLSX, same layout convention as QS)
+    # ------------------------------------------------------------------
+    the_lookup = THERankingLookup.get()
+    the_results: dict[str, dict] = {}
+    institutions_the_ranked = 0
+
+    for rec in records:
+        inst = rec.institution
+        if not inst or inst in the_results:
+            continue
+        the_hit = the_lookup.lookup(inst)
+        if the_hit:
+            the_results[inst] = the_hit
+            institutions_the_ranked += 1
+            raw_tr = the_hit.get("rank_int")
+            if raw_tr is None:
+                try:
+                    raw_tr = int(str(the_hit.get("rank", "")).lstrip("=").split("-")[0].replace("+", ""))
+                except (ValueError, AttributeError):
+                    raw_tr = None
+            rec.institution_the_ranking = raw_tr
+            if not rec.institution_qs_ranking:
+                rec.institution_ranking_source = "THE"
+                rec.institution_ranking_year = 2026
+                rec.institution_ranking_value = str(the_hit.get("rank") or raw_tr or "")
+            _upsert_institution_ranking_the(db, candidate_id, inst, the_hit)
+
+    # ------------------------------------------------------------------
     # 4. Gap detection
     # ------------------------------------------------------------------
     gaps = _detect_education_gaps(records)
@@ -606,7 +673,7 @@ def run_education_analysis(
     # ------------------------------------------------------------------
     # 7. Groq LLM assessment
     # ------------------------------------------------------------------
-    user_prompt = _build_education_prompt(records, gaps, gap_justifications, qs_results)
+    user_prompt = _build_education_prompt(records, gaps, gap_justifications, qs_results, the_results)
     llm_result = analysis_llm_call(_EDUCATION_SYSTEM_PROMPT, user_prompt, max_tokens=1500)
     llm_used = llm_result is not None and isinstance(llm_result, dict)
 
@@ -652,8 +719,8 @@ def run_education_analysis(
     try:
         db.commit()
         logger.info(
-            "[EduAnalysis] Done candidate=%d | score=%.1f | gaps=%d | justified=%d | ranked=%d | missing=%d",
-            candidate_id, edu_score, len(gaps), justified_count, institutions_ranked, len(missing_fields),
+            "[EduAnalysis] Done candidate=%d | score=%.1f | gaps=%d | justified=%d | qs_ranked=%d | the_ranked=%d | missing=%d",
+            candidate_id, edu_score, len(gaps), justified_count, institutions_ranked, institutions_the_ranked, len(missing_fields),
         )
     except Exception as exc:
         db.rollback()
@@ -666,6 +733,7 @@ def run_education_analysis(
         gaps_detected=len(gaps),
         gaps_justified=justified_count,
         institutions_ranked=institutions_ranked,
+        institutions_the_ranked=institutions_the_ranked,
         education_strength_score=edu_score,
         progression_assessment=progression,
         specialization_consistency=specialization,

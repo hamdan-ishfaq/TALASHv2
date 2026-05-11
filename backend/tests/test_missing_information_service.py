@@ -4,7 +4,7 @@ import unittest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.models.models import Base, Candidate, MissingInformationRequest
+from app.models.models import Base, Candidate, EducationRecord, MissingInformationRequest, WorkExperience
 from app.services.missing_information_service import generate_missing_information_requests
 
 
@@ -67,6 +67,65 @@ class TestMissingInformationService(unittest.TestCase):
 
         reqs = db.query(MissingInformationRequest).filter_by(candidate_id=cand.id, module_name="patents").all()
         self.assertEqual(len(reqs), 1)
+
+        db.close()
+
+    def test_education_incomplete_creates_request(self):
+        db = self.Session()
+        cand = Candidate(name="Edu", email=None, raw_text="")
+        db.add(cand)
+        db.commit()
+        db.add(
+            EducationRecord(
+                candidate_id=cand.id,
+                stage="SSE",
+                institution="Govt High School",
+                marks_percentage=None,
+                cgpa=None,
+            )
+        )
+        db.commit()
+
+        res = generate_missing_information_requests(db, cand.id, modules=["education_analysis"], force=False)
+        db.commit()
+
+        self.assertIn("education_analysis", res.generated_modules)
+        req = (
+            db.query(MissingInformationRequest)
+            .filter_by(candidate_id=cand.id, module_name="education_analysis")
+            .first()
+        )
+        self.assertIsNotNone(req)
+        fields = json.loads(req.missing_fields_json or "[]")
+        self.assertTrue(any("marks" in f.lower() or "percentage" in f.lower() for f in fields))
+
+        db.close()
+
+    def test_experience_missing_dates_creates_request(self):
+        db = self.Session()
+        cand = Candidate(name="Exp", email=None, raw_text="")
+        db.add(cand)
+        db.commit()
+        db.add(
+            WorkExperience(
+                candidate_id=cand.id,
+                job_title="Engineer",
+                organization="ACME",
+                is_current=False,
+            )
+        )
+        db.commit()
+
+        res = generate_missing_information_requests(db, cand.id, modules=["experience_analysis"], force=False)
+        db.commit()
+
+        self.assertIn("experience_analysis", res.generated_modules)
+        req = (
+            db.query(MissingInformationRequest)
+            .filter_by(candidate_id=cand.id, module_name="experience_analysis")
+            .first()
+        )
+        self.assertIsNotNone(req)
 
         db.close()
 

@@ -60,6 +60,9 @@ dump.rdb
 Thumbs.db
 .DS_Store
 frontend/node_modules/
+frontend/node_modules/.cache/
+*:Zone.Identifier
+*.mp4
 backend/data/exports/
 *.pdf
 *.xlsx
@@ -68,4 +71,3 @@ backend/data/tmp_split/*
 *.csv
 *.log
 backend/logs/
-frontend/node_modules/

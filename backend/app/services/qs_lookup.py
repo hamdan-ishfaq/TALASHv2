@@ -59,23 +59,19 @@ class QSRankingLookup:
         logger.info("QS Rankings loaded: %d institutions from %s", len(self._entries), xlsx_path)
 
     def _load(self, path: str) -> None:
+        from app.services.ranking_xlsx import iter_ranking_rows
+
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb.active
-
-        # Skip row 1 (title), row 2 (headers per spec), start reading from row 3
-        # Column mapping: 1=seq, 2=rank2026, 3=rank2025, 4=Institution, 5=Location
-        for row in ws.iter_rows(min_row=3, values_only=True):
-            if not row or row[3] is None:   # col4 = Institution (0-indexed → col[3])
-                continue
-            institution = str(row[3]).strip()
-            if not institution:
-                continue
-            self._entries.append(_QSEntry(
-                institution=institution,
-                location=str(row[4]) if row[4] else "",
-                rank_2026=row[1],   # col2
-                rank_2025=row[2],   # col3
-            ))
+        for institution, rank_p, rank_s, loc in iter_ranking_rows(ws):
+            self._entries.append(
+                _QSEntry(
+                    institution=institution,
+                    location=loc or "",
+                    rank_2026=rank_p or None,
+                    rank_2025=rank_s or None,
+                )
+            )
         wb.close()
 
     @classmethod

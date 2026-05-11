@@ -12,17 +12,21 @@ from app.models.models import (
     Book,
     Candidate,
     ConferencePublication,
+    EducationRecord,
     JournalPublication,
     MissingInformationRequest,
     Patent,
     Skill,
     SupervisionRecord,
+    WorkExperience,
 )
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_MODULES: tuple[str, ...] = (
+    "education_analysis",
+    "experience_analysis",
     "research_analysis",
     "patents",
     "books",
@@ -101,10 +105,49 @@ def _build_email(candidate_name: str | None, module_name: str, missing_fields: l
         f"Hello {display_name},\n\n"
         f"To complete your profile review, we need a few additional details for: {pretty_module}.\n\n"
         f"Please provide the following:\n{bullets}\n\n"
+        "If any item does not apply, reply with a short note so we can mark it as not applicable.\n\n"
+        "Please reply with the missing details or attach an updated CV.\n\n"
         "Thanks,\n"
         "TALASH Team\n"
     )
     return subject, body
+
+
+def _education_missing_labels(db: Session, candidate_id: int) -> list[str]:
+    labels: list[str] = []
+    for rec in db.query(EducationRecord).filter_by(candidate_id=candidate_id).all():
+        stage = (rec.stage or "").upper()
+        label_bits: list[str] = []
+        if stage in ("SSE", "HSSC", "MATRIC", "INTERMEDIATE", "O-LEVEL", "A-LEVEL"):
+            if rec.marks_percentage is None and rec.cgpa is None:
+                label_bits.append("marks or percentage")
+        elif stage in ("UG", "PG", "PHD", "BS", "MS", "MSC", "MPHIL", "BSC", "OTHER") or (rec.degree_title or "").strip():
+            if rec.cgpa is None and rec.marks_percentage is None and rec.normalized_cgpa is None:
+                label_bits.append("CGPA or percentage")
+            if rec.cgpa is not None and (rec.cgpa_scale is None or rec.cgpa_scale <= 0):
+                label_bits.append("CGPA scale (e.g. 4.0)")
+        if not (rec.institution or "").strip() and not (rec.board_or_university or "").strip():
+            label_bits.append("institution or board name")
+        if rec.start_year is None and rec.end_year is None:
+            label_bits.append("start or end year")
+        if label_bits:
+            who = rec.degree_title or rec.stage or "education entry"
+            labels.append(f"{who}: " + ", ".join(sorted(set(label_bits))))
+    return list(dict.fromkeys(labels))
+
+
+def _experience_missing_labels(db: Session, candidate_id: int) -> list[str]:
+    labels: list[str] = []
+    for w in db.query(WorkExperience).filter_by(candidate_id=candidate_id).all():
+        title = (w.job_title or "Role").strip()
+        missing: list[str] = []
+        if w.start_date is None and w.start_year is None:
+            missing.append("start date")
+        if not w.is_current and w.end_date is None and w.end_year is None:
+            missing.append("end date or mark role as current")
+        if missing:
+            labels.append(f"{title}: " + ", ".join(missing))
+    return list(dict.fromkeys(labels))
 
 
 def generate_missing_information_requests(
@@ -196,6 +239,34 @@ def generate_missing_information_requests(
             signals=[r"\bskills\b", r"\bexpertise\b", r"\bcompetenc"],
             missing_fields=["skills_list"],
         )
+
+    if "education_analysis" in normalized_modules:
+        edu_labels = _education_missing_labels(db, candidate_id)
+        if edu_labels:
+            subject, body = _build_email(cand.name, "education_analysis", edu_labels)
+            _upsert_missing_info_request(
+                db,
+                candidate_id=candidate_id,
+                module_name="education_analysis",
+                missing_fields=edu_labels,
+                subject=subject,
+                body=body,
+            )
+            generated.append("education_analysis")
+
+    if "experience_analysis" in normalized_modules:
+        exp_labels = _experience_missing_labels(db, candidate_id)
+        if exp_labels:
+            subject, body = _build_email(cand.name, "experience_analysis", exp_labels)
+            _upsert_missing_info_request(
+                db,
+                candidate_id=candidate_id,
+                module_name="experience_analysis",
+                missing_fields=exp_labels,
+                subject=subject,
+                body=body,
+            )
+            generated.append("experience_analysis")
 
     if generated:
         logger.info(

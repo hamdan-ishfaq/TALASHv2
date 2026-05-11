@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 COLUMN_ADDITIONS: dict[str, list[tuple[str, str]]] = {
     "candidates": [
+        ("target_job_description", "TEXT"),
         ("phone", "VARCHAR(50)"),
         ("linkedin_url", "VARCHAR(500)"),
         ("personal_website", "VARCHAR(500)"),
@@ -98,6 +99,9 @@ COLUMN_ADDITIONS: dict[str, list[tuple[str, str]]] = {
         ("work_evidence", "TEXT"),
         ("research_evidence", "TEXT"),
         ("confidence_score", "FLOAT"),
+    ],
+    "candidate_assessments": [
+        ("jd_alignment_score", "FLOAT"),
     ],
 }
 

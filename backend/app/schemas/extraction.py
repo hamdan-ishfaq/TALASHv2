@@ -359,3 +359,18 @@ class CandidateExtraction(_NullListCoercionMixin):
     raw_llm_response: Optional[str] = Field(None, description="Optional raw model response preserved for auditability.")
     llm_model_name: Optional[str] = Field(None, description="Model used for extraction (e.g., 'openrouter/free').")
     llm_provider: Optional[str] = Field(None, description="Provider name (e.g., 'openrouter').")
+
+    @model_validator(mode="after")
+    def _trim_core_strings(self):
+        if self.name:
+            n = self.name.strip()
+            if len(n) > 180:
+                n = n[:180].strip()
+            object.__setattr__(self, "name", n)
+        if self.raw_llm_response and len(self.raw_llm_response) > 500_000:
+            object.__setattr__(
+                self,
+                "raw_llm_response",
+                self.raw_llm_response[:400_000] + "\n...[truncated]...",
+            )
+        return self

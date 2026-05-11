@@ -27,6 +27,8 @@ class Candidate(Base):
     extraction_flags_json = Column(Text, nullable=True)       # JSON array e.g. ["ACADEMIC_EXTRACTION_FAILED"]
     requires_manual_review = Column(Boolean, default=False, nullable=False)
     raw_extracted_email = Column(String(255), nullable=True)   # Pre-mismatch-clearing email for audit
+    # Target role / job description for §3.9 skill–JD alignment (optional; set via API)
+    target_job_description = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -397,6 +399,7 @@ class CandidateAssessment(Base):
     research_strength_score = Column(Float, nullable=True)
     experience_strength_score = Column(Float, nullable=True)
     skill_alignment_score = Column(Float, nullable=True)
+    jd_alignment_score = Column(Float, nullable=True)  # 0–10: claimed skills vs target JD text
     overall_rank = Column(Float, nullable=True)
     overall_summary = Column(Text, nullable=True)
     missing_sections_json = Column(Text, nullable=True)

@@ -57,8 +57,9 @@ class CVFolderEventHandler(FileSystemEventHandler):
                 logger.debug(f"File not ready yet: {path.name}")
                 return
             
-            # Avoid reprocessing the same file
-            file_id = (path.name, path.stat().st_size)
+            # Avoid reprocessing the same file (include mtime so same-size replacements re-queue)
+            st = path.stat()
+            file_id = (path.name, st.st_size, int(st.st_mtime))
             if file_id in self.processed_files:
                 logger.debug(f"File already processed: {path.name}")
                 return

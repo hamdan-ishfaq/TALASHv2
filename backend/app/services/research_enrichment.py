@@ -7,23 +7,103 @@ All external API calls live here — separated from scoring so they can be
 tested and replaced independently.
 
 External APIs used:
-  - Crossref   (title search + DOI lookup) — free, no key required
-  - OpenAlex   (journal stats + conference age) — free, no key required
-  - wos-journal.info (WoS/impact-factor scrape) — free, fragile, has fallback
+  - Crossref   (https://api.crossref.org) — free, no key; DOI + title search
+  - OpenAlex   (https://api.openalex.org) — free, no key; journal ``/sources/issn:…`` + works search
+  - DOAJ       (https://doaj.org/api/search/journals/…) — free OA journal registry by ISSN
+  - wos-journal.info — optional HTML scrape (fragile); off by default (``TALASH_ENABLE_WOS_SCRAPE``)
 
-Called from research_analysis.py via asyncio.run().
+Performance / etiquette:
+  - In-process ISSN cache for OpenAlex + DOAJ (reduces duplicate HTTP across many papers).
+  - Set ``TALASH_OPENALEX_MAILTO`` to your email for OpenAlex polite-pool rate limits.
+  - ``TALASH_ENABLE_WOS_SCRAPE=1`` re-enables WoS scrape when you accept slower, brittle calls.
+
+Called from research_analysis.py via sync_async.run_coro_sync().
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from difflib import SequenceMatcher
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Shared HTTP cache (per worker process; safe under asyncio single-thread)
+# ---------------------------------------------------------------------------
+_OA_ISSN_CACHE: dict[str, dict[str, Any]] = {}
+_DOAJ_ISSN_CACHE: dict[str, dict[str, Any]] = {}
+_EXT_CACHE_LOCK: asyncio.Lock | None = None
+_EXT_CACHE_MAX = 8000
+
+
+def _ext_lock() -> asyncio.Lock:
+    global _EXT_CACHE_LOCK
+    if _EXT_CACHE_LOCK is None:
+        _EXT_CACHE_LOCK = asyncio.Lock()
+    return _EXT_CACHE_LOCK
+
+
+def _trim_cache(store: dict[str, Any]) -> None:
+    if len(store) <= _EXT_CACHE_MAX:
+        return
+    for i, k in enumerate(list(store.keys())):
+        if i >= _EXT_CACHE_MAX // 2:
+            break
+        store.pop(k, None)
+
+
+def _openalex_append_mailto(url: str) -> str:
+    mailto = os.getenv("TALASH_OPENALEX_MAILTO", "").strip()
+    if not mailto:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}mailto={quote(mailto)}"
+
+
+def _normalize_issn_key(issn: str) -> str:
+    return re.sub(r"[-\s]", "", (issn or "")).lower()
+
+
+def _issn_display(issn: str) -> str:
+    """Prefer hyphenated ISSN for OpenAlex ``sources/issn:`` URLs."""
+    raw = re.sub(r"[^0-9Xx]", "", issn or "")
+    if len(raw) == 8:
+        return f"{raw[:4]}-{raw[4:8]}".upper()
+    return (issn or "").strip()
+
+
+def _openalex_tier_from_stats(
+    h_index: Any,
+    mean_citedness: Any,
+    works_count: Any,
+) -> str:
+    """Heuristic venue strength when Scimago quartile is missing (not a Q1–Q4 replacement)."""
+    try:
+        h = int(h_index) if h_index is not None else 0
+    except (TypeError, ValueError):
+        h = 0
+    try:
+        c2 = float(mean_citedness) if mean_citedness is not None else 0.0
+    except (TypeError, ValueError):
+        c2 = 0.0
+    try:
+        wc = int(works_count) if works_count is not None else 0
+    except (TypeError, ValueError):
+        wc = 0
+
+    if h >= 70 or c2 >= 2.5 or wc >= 40000:
+        return "strong"
+    if h >= 28 or c2 >= 1.0 or wc >= 8000:
+        return "medium"
+    if h >= 10 or c2 >= 0.35 or wc >= 1500:
+        return "modest"
+    return "weak"
 
 # ---------------------------------------------------------------------------
 # Thresholds
@@ -37,6 +117,15 @@ TITLE_SIM_THRESHOLD      = 0.82 # fuzzy similarity gate
 # ---------------------------------------------------------------------------
 def _sim(a: str, b: str) -> float:
     return SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio()
+
+
+def _crossref_headers() -> dict[str, str]:
+    """Crossref requests a contact in User-Agent; reuse OpenAlex mailto when set."""
+    mail = os.getenv("TALASH_OPENALEX_MAILTO", os.getenv("TALASH_CROSSREF_MAILTO", "")).strip()
+    ua = "TALASH/1.0 (https://github.com; academic CV enrichment)"
+    if mail:
+        ua += f" mailto:{mail}"
+    return {"User-Agent": ua}
 
 
 # ============================================================================
@@ -100,10 +189,9 @@ async def _resolve_via_crossref(session: aiohttp.ClientSession, title: str) -> d
                 "score,published,published-print,published-online,event,type"
             ),
         }
-        headers = {"User-Agent": "TALASH-ResearchProfiler/1.0 (research@talash.edu)"}
         async with session.get(
             "https://api.crossref.org/works",
-            params=params, headers=headers,
+            params=params, headers=_crossref_headers(),
             timeout=aiohttp.ClientTimeout(total=14),
         ) as r:
             if r.status != 200:
@@ -149,8 +237,9 @@ async def _resolve_via_openalex(session: aiohttp.ClientSession, title: str) -> d
             "per-page": 3,
             "select":   "doi,ids,primary_location,publication_year,title",
         }
+        url = _openalex_append_mailto("https://api.openalex.org/works")
         async with session.get(
-            "https://api.openalex.org/works",
+            url,
             params=params,
             timeout=aiohttp.ClientTimeout(total=12),
         ) as r:
@@ -253,30 +342,113 @@ async def recover_metadata_by_title(pub: dict,
 # STEP 1 — Journal enrichment
 # ============================================================================
 
-async def fetch_openalex_journal(session: aiohttp.ClientSession,
-                                  issn: str) -> dict:
-    """Get citation stats and h-index from OpenAlex for a journal ISSN."""
+async def _fetch_openalex_journal_uncached(session: aiohttp.ClientSession, issn: str) -> dict:
+    """
+    OpenAlex ``GET /sources/issn:XXXX-XXXX`` (single object) — faster than filter search.
+    Falls back to ``sources?filter=issn:`` if the direct id 404s.
+    """
     if not issn:
         return {}
+    disp = _issn_display(issn)
+    headers = {"User-Agent": "TALASH/1.0 (https://github.com; research metadata enrichment)"}
+    timeout = aiohttp.ClientTimeout(total=12)
+
+    def _parse_source(src: dict) -> dict:
+        stats = src.get("summary_stats") or {}
+        raw_2yr = stats.get("2yr_mean_citedness")
+        h_idx = stats.get("h_index")
+        wc = src.get("works_count")
+        tier = _openalex_tier_from_stats(h_idx, raw_2yr, wc)
+        return {
+            "found": True,
+            "avg_citations_2yr": round(raw_2yr, 4) if raw_2yr is not None else None,
+            "h_index": h_idx,
+            "works_count": wc,
+            "cited_by_count": src.get("cited_by_count"),
+            "openalex_journal_tier": tier,
+            "oa_scopus_proxy": (int(h_idx or 0) >= 12 and int(wc or 0) > 1500),
+            "openalex_source_id": src.get("id"),
+        }
+
     try:
-        async with session.get(
-            f"https://api.openalex.org/sources?filter=issn:{issn}",
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            data = await r.json(content_type=None)
-        results = data.get("results", [])
+        url = _openalex_append_mailto(f"https://api.openalex.org/sources/issn:{disp}")
+        async with session.get(url, timeout=timeout, headers=headers) as r:
+            if r.status == 200:
+                src = await r.json(content_type=None)
+                if isinstance(src, dict) and src.get("summary_stats") is not None:
+                    return _parse_source(src)
+        fb = _openalex_append_mailto(f"https://api.openalex.org/sources?filter=issn:{disp}&per-page=1")
+        async with session.get(fb, timeout=timeout, headers=headers) as r2:
+            if r2.status != 200:
+                return {}
+            data = await r2.json(content_type=None)
+        results = data.get("results") or []
         if not results:
             return {}
-        stats   = results[0].get("summary_stats", {})
-        raw_2yr = stats.get("2yr_mean_citedness")
-        return {
-            "found":             True,
-            "avg_citations_2yr": round(raw_2yr, 3) if raw_2yr is not None else None,
-            "h_index":           stats.get("h_index"),
-            "scopus_proxy":      (stats.get("h_index") or 0) > 10,
-        }
-    except Exception:
+        return _parse_source(results[0])
+    except Exception as exc:
+        logger.debug("[OpenAlex journal] %s", exc)
         return {}
+
+
+async def fetch_openalex_journal(session: aiohttp.ClientSession, issn: str) -> dict:
+    """Cached OpenAlex journal lookup by ISSN."""
+    key = _normalize_issn_key(issn)
+    if not key:
+        return {}
+    async with _ext_lock():
+        hit = _OA_ISSN_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+    out = await _fetch_openalex_journal_uncached(session, issn)
+    async with _ext_lock():
+        _trim_cache(_OA_ISSN_CACHE)
+        _OA_ISSN_CACHE[key] = out
+    return dict(out)
+
+
+async def fetch_doaj_by_issn(session: aiohttp.ClientSession, issn: str) -> dict:
+    """
+    DOAJ public search API — confirms the ISSN appears in the DOAJ journal index (no API key).
+    https://doaj.org/api/docs
+    """
+    key = _normalize_issn_key(issn)
+    if not key:
+        return {"doaj_indexed": False, "doaj_hits": 0}
+    async with _ext_lock():
+        hit = _DOAJ_ISSN_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+
+    compact = key.upper()
+    hyphen = f"{compact[:4]}-{compact[4:]}" if len(compact) == 8 else issn.strip()
+    urls = [
+        f"https://doaj.org/api/search/journals/issn:{quote(hyphen)}",
+        f"https://doaj.org/api/search/journals/issn:{quote(compact)}",
+    ]
+    headers = {"User-Agent": "TALASH/1.0 (journal presence check; contact via project maintainer)"}
+    out: dict[str, Any] = {"doaj_indexed": False, "doaj_hits": 0}
+    try:
+        for url in urls:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json(content_type=None)
+            total = data.get("total")
+            try:
+                n = int(total) if total is not None else 0
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                out = {"doaj_indexed": True, "doaj_hits": n}
+                break
+    except Exception as exc:
+        logger.debug("[DOAJ] %s", exc)
+
+    async with _ext_lock():
+        _trim_cache(_DOAJ_ISSN_CACHE)
+        _DOAJ_ISSN_CACHE[key] = out
+    return dict(out)
 
 
 async def fetch_wos_info(session: aiohttp.ClientSession, issn: str) -> dict:
@@ -327,10 +499,9 @@ async def fetch_crossref_doi(session: aiohttp.ClientSession,
     if not doi:
         return {"found": False}
     try:
-        headers = {"User-Agent": "TALASH-ResearchProfiler/1.0 (research@talash.edu)"}
         async with session.get(
             f"https://api.crossref.org/works/{doi}",
-            headers=headers,
+            headers=_crossref_headers(),
             timeout=aiohttp.ClientTimeout(total=12),
         ) as r:
             if r.status != 200:
@@ -440,7 +611,7 @@ async def fetch_openalex_conf_age(session: aiohttp.ClientSession,
 
     for q in strategies:
         try:
-            url = (
+            url = _openalex_append_mailto(
                 "https://api.openalex.org/works"
                 f"?filter=primary_location.source.display_name.search:{q}"
                 "&sort=publication_year:asc&per-page=1"
@@ -469,24 +640,39 @@ async def enrich_journal_pub(pub: dict, session: aiohttp.ClientSession,
     issn = pub.get("issn") or ""
     doi  = pub.get("doi") or ""
 
-    wos, oa, cr = await asyncio.gather(
-        fetch_wos_info(session, issn),
-        fetch_openalex_journal(session, issn),
-        fetch_crossref_doi(session, doi, candidate_name),
-    )
+    enable_wos = os.getenv("TALASH_ENABLE_WOS_SCRAPE", "0").strip().lower() in ("1", "true", "yes")
+    if enable_wos:
+        wos, oa, cr, doaj = await asyncio.gather(
+            fetch_wos_info(session, issn),
+            fetch_openalex_journal(session, issn),
+            fetch_crossref_doi(session, doi, candidate_name),
+            fetch_doaj_by_issn(session, issn),
+        )
+    else:
+        oa, cr, doaj = await asyncio.gather(
+            fetch_openalex_journal(session, issn),
+            fetch_crossref_doi(session, doi, candidate_name),
+            fetch_doaj_by_issn(session, issn),
+        )
+        wos = {"wos_indexed": False, "impact_factor": None}
 
-    # impact_factor: WoS value preferred; fall back to OA 2yr mean citedness
+    # impact_factor: WoS scrape when enabled; else use OpenAlex 2yr mean citedness as numeric signal
     impact_factor = wos.get("impact_factor") if wos.get("impact_factor") is not None else oa.get("avg_citations_2yr")
 
     pub.update({
-        "wos_indexed":       wos.get("wos_indexed", False),
-        "impact_factor":     impact_factor,
+        "wos_indexed": wos.get("wos_indexed", False),
+        "impact_factor": impact_factor,
         "avg_citations_2yr": oa.get("avg_citations_2yr"),
-        "h_index":           oa.get("h_index"),
-        "oa_scopus_proxy":   oa.get("scopus_proxy", False),
-        "crossref_found":    cr.get("found", False),
+        "h_index": oa.get("h_index"),
+        "works_count": oa.get("works_count"),
+        "cited_by_count": oa.get("cited_by_count"),
+        "openalex_journal_tier": oa.get("openalex_journal_tier", "weak"),
+        "oa_scopus_proxy": oa.get("oa_scopus_proxy", False),
+        "doaj_indexed": bool(doaj.get("doaj_indexed")),
+        "doaj_hits": int(doaj.get("doaj_hits") or 0),
+        "crossref_found": cr.get("found", False),
         "authorship_role_api": cr.get("role", "unknown"),
-        "publisher_cr":      cr.get("publisher", ""),
+        "publisher_cr": cr.get("publisher", ""),
     })
     return pub
 
@@ -517,23 +703,72 @@ async def enrich_all_publications(
     journals: list[dict],
     conferences: list[dict],
     candidate_name: str,
-    max_concurrent: int = 10,
-) -> tuple[list[dict], list[dict]]:
+    max_concurrent: int | None = None,
+) -> tuple[list[dict], list[dict], dict]:
     """
     Run all enrichment tasks concurrently.
-    Returns (enriched_journals, enriched_conferences).
+    Returns (enriched_journals, enriched_conferences, audit_dict).
+
+    audit_dict keys: skipped (bool), warnings (list[str]), errors (list[str]),
+    publications_attempted (int), publications_enriched_ok (int).
     """
+    audit: dict = {
+        "skipped": False,
+        "warnings": [],
+        "errors": [],
+        "publications_attempted": 0,
+        "publications_enriched_ok": 0,
+    }
+    total = len(journals) + len(conferences)
+    if total == 0:
+        return [], [], audit
+
+    if max_concurrent is None:
+        try:
+            max_concurrent = int(os.getenv("TALASH_ENRICHMENT_CONCURRENCY", "5") or "5")
+        except ValueError:
+            max_concurrent = 5
+    max_concurrent = max(1, min(int(max_concurrent), 25))
+
+    skip_gt = int(os.getenv("TALASH_SKIP_ENRICHMENT_IF_PUBS_GT", "150") or "150")
+    if total > skip_gt:
+        audit["skipped"] = True
+        audit["warnings"].append(
+            f"Skipped network enrichment: {total} publications exceed TALASH_SKIP_ENRICHMENT_IF_PUBS_GT={skip_gt}. "
+            "Scores use CV metadata only."
+        )
+        return [dict(p) for p in journals], [dict(p) for p in conferences], audit
+
+    audit["publications_attempted"] = total
+
     connector = aiohttp.TCPConnector(limit=max_concurrent, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        journal_tasks = [
-            enrich_journal_pub(dict(p), session, candidate_name)
-            for p in journals
-        ]
-        conf_tasks = [
-            enrich_conference_pub(dict(p), session, candidate_name)
-            for p in conferences
-        ]
-        results = await asyncio.gather(*(journal_tasks + conf_tasks))
+        journal_tasks = [enrich_journal_pub(dict(p), session, candidate_name) for p in journals]
+        conf_tasks = [enrich_conference_pub(dict(p), session, candidate_name) for p in conferences]
+        results = await asyncio.gather(*(journal_tasks + conf_tasks), return_exceptions=True)
 
     n = len(journals)
-    return list(results[:n]), list(results[n:])
+    out_j: list[dict] = []
+    out_c: list[dict] = []
+    ok = 0
+    for i, r in enumerate(results[:n]):
+        if isinstance(r, Exception):
+            audit["errors"].append(f"journal id={journals[i].get('id')}: {r!s}")
+            out_j.append(dict(journals[i]))
+        else:
+            out_j.append(r)
+            ok += 1
+    for i, r in enumerate(results[n:]):
+        if isinstance(r, Exception):
+            audit["errors"].append(f"conference id={conferences[i].get('id')}: {r!s}")
+            out_c.append(dict(conferences[i]))
+        else:
+            out_c.append(r)
+            ok += 1
+
+    audit["publications_enriched_ok"] = ok
+    if audit["errors"]:
+        audit["warnings"].append(
+            f"{len(audit['errors'])} publication(s) failed enrichment; scoring uses partial metadata."
+        )
+    return out_j, out_c, audit

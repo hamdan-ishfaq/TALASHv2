@@ -17,6 +17,23 @@ from app.models.models import Candidate, CollaborationEdge, ConferencePublicatio
 
 logger = logging.getLogger(__name__)
 
+# Substrings commonly appearing in affiliation lines (lowercase)
+_COUNTRY_MARKERS: tuple[str, ...] = (
+    "pakistan", "india", "china", "usa", "united states", "u.s.", "uk", "united kingdom",
+    "germany", "france", "canada", "australia", "japan", "korea", "saudi", "uae",
+    "turkey", "italy", "spain", "netherlands", "sweden", "norway", "brazil", "mexico",
+    "egypt", "malaysia", "singapore", "thailand", "vietnam", "viet nam", "bangladesh",
+    "iran", "iraq", "jordan", "qatar", "kuwait", "austria", "switzerland", "belgium",
+    "poland", "czech", "russia", "ukraine", "south africa", "nigeria", "kenya",
+)
+
+
+def _countries_in_text(text: str | None) -> set[str]:
+    if not text:
+        return set()
+    t = text.lower()
+    return {m for m in _COUNTRY_MARKERS if m in t}
+
 
 def _split_authors(authors_text: str | None) -> list[str]:
     if not authors_text:
@@ -34,6 +51,9 @@ class CollaborationAnalysisResult:
     total_edges: int = 0
     avg_coauthors_per_paper: float = 0.0
     top_collaborators: list[dict] = field(default_factory=list)
+    affiliations_populated: int = 0
+    inferred_region_diversity: int = 0
+    international_collaboration_hint: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -43,6 +63,9 @@ class CollaborationAnalysisResult:
             "total_edges": self.total_edges,
             "avg_coauthors_per_paper": round(self.avg_coauthors_per_paper, 2),
             "top_collaborators": self.top_collaborators[:15],
+            "affiliations_populated": self.affiliations_populated,
+            "inferred_region_diversity": self.inferred_region_diversity,
+            "international_collaboration_hint": self.international_collaboration_hint,
         }
 
 
@@ -82,6 +105,27 @@ def run_collaboration_analysis(db: Session, candidate_id: int) -> CollaborationA
         for name, count in key_counts.most_common(15)
     ]
 
+    affil_hits = 0
+    all_regions: set[str] = set()
+    for e in edges:
+        regs = _countries_in_text(e.coauthor_affiliation)
+        if regs:
+            affil_hits += 1
+        all_regions |= regs
+
+    region_div = len(all_regions)
+    if affil_hits == 0:
+        hint = "Co-author affiliations not populated; regional collaboration cannot be inferred."
+    elif region_div >= 3:
+        hint = "Multiple geographic regions inferred from co-author affiliations (likely international breadth)."
+    elif region_div == 2:
+        hint = "Two distinct regions suggested from affiliations — moderate international or cross-border collaboration."
+    elif region_div == 1:
+        hint = "Affiliations suggest a single dominant region; collaboration may be mostly domestic or data is sparse."
+    else:
+        hint = "Affiliation text present but no known country markers detected."
+    hint += " (Heuristic over affiliation substrings — verify manually.)"
+
     result = CollaborationAnalysisResult(
         candidate_id=candidate_id,
         unique_coauthors=len(key_counts),
@@ -89,6 +133,9 @@ def run_collaboration_analysis(db: Session, candidate_id: int) -> CollaborationA
         total_edges=len(edges),
         avg_coauthors_per_paper=avg_co,
         top_collaborators=top,
+        affiliations_populated=affil_hits,
+        inferred_region_diversity=region_div,
+        international_collaboration_hint=hint,
     )
     db.commit()
     logger.info(
