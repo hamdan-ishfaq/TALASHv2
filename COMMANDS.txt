@@ -68,7 +68,8 @@ Option B: Using terminal command
 
    Linux/Mac (cURL):
    ────────────────────────────────────────────────────────────────────────────
-   curl -X POST -F "file=@backend/data/cvs/sample.pdf" http://localhost:8000/upload
+   curl -X POST -F "file=@backend/data/cvs/your_cv.pdf" http://localhost:8000/upload
+   (Place PDFs in backend/data/cvs/ — split bundle outputs go to backend/data/cvs_split/ first; see README.)
 
 
 ⭐ STEP 5: WATCH THE LOGS WHILE PROCESSING

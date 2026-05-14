@@ -12,7 +12,7 @@ from typing import List
 
 # Configuration
 INPUT_PDFS = ["CVs.pdf", "Talash.pdf"]  # Try both if they exist
-OUTPUT_DIR = "backend/data/cvs"
+OUTPUT_DIR = "backend/data/cvs_split"
 
 def is_blank_page(page) -> bool:
     """Check if a page is mostly blank."""
@@ -71,7 +71,7 @@ def split_pdf_all(input_pdf: str, output_dir: str) -> List[str]:
         
         # Skip if already exists
         if os.path.exists(output_pdf):
-            print(f"  ⊘ CV {cv_num:3d}: pages {start:3d}-{end:3d} → ALREADY EXISTS")
+            print(f"  [SKIP] CV {cv_num:3d}: pages {start:3d}-{end:3d} → ALREADY EXISTS")
             continue
         
         # Create new doc with selected pages
@@ -83,7 +83,7 @@ def split_pdf_all(input_pdf: str, output_dir: str) -> List[str]:
         new_doc.close()
         
         file_size_mb = os.path.getsize(output_pdf) / (1024 * 1024)
-        print(f"  ✓ CV {cv_num:3d}: pages {start:3d}-{end:3d} → {output_pdf} ({file_size_mb:.2f} MB)")
+        print(f"  [OK] CV {cv_num:3d}: pages {start:3d}-{end:3d} → {output_pdf} ({file_size_mb:.2f} MB)")
         output_files.append(output_pdf)
     
     doc.close()
@@ -118,10 +118,10 @@ def main():
     print(f"Total CVs split: {total_split}")
     print(f"Location: {os.path.abspath(OUTPUT_DIR)}")
     print("\nAutomatic Processing:")
-    print("  ✓ Folder monitor is watching for new PDFs in backend/data/cvs/")
-    print("  ✓ Split CVs will be automatically detected and queued")
-    print("  ✓ Check Celery worker: docker-compose logs worker -f")
-    print("  ✓ Monitor progress: http://localhost:5555 (Flower)")
+    print("  [OK] Folder monitor is watching for new PDFs in backend/data/cvs/")
+    print("  [OK] Split CVs will be automatically detected and queued")
+    print("  [OK] Check Celery worker: docker-compose logs worker -f")
+    print("  [OK] Monitor progress: http://localhost:5555 (Flower)")
     print("=" * 90)
 
 if __name__ == "__main__":

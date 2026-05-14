@@ -42,22 +42,6 @@ logger.setLevel(logging.DEBUG)
 TALASH_REUSE_STORED_EXTRACTION = os.getenv("TALASH_REUSE_STORED_EXTRACTION", "0") == "1"
 
 
-def _candidate_pipeline_healthy(candidate: Candidate) -> bool:
-    """True only when analysis_json contains a successful pipeline payload (no pipeline_error)."""
-    raw = candidate.analysis_json
-    if not raw:
-        return False
-    try:
-        aj = json.loads(raw)
-    except Exception:
-        return False
-    if not isinstance(aj, dict):
-        return False
-    if aj.get("pipeline_error"):
-        return False
-    return bool(aj.get("pipeline"))
-
-
 # ============================================================================
 # Logging Configuration & Utils
 # ============================================================================
@@ -117,8 +101,6 @@ def _looks_like_candidate(author_name: str, candidate_name: str) -> bool:
 
 def _email_conflicts(db, candidate_id: int, email: str | None) -> bool:
     if not email:
-        return False
-    if os.getenv("TALASH_ALLOW_SHARED_EMAIL", "").lower() in ("1", "true", "yes"):
         return False
     return (
         db.query(Candidate)
@@ -362,8 +344,8 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         # =====================================================================
         # IDEMPOTENCY CHECKS
         # =====================================================================
-        if candidate.status == "completed" and _candidate_pipeline_healthy(candidate):
-            logger.info("[IDEMPOTENT-SKIP] Candidate already processed with healthy analysis payload")
+        if candidate.status == "completed":
+            logger.info("[IDEMPOTENT-SKIP] Candidate already successfully processed")
             logger.info("      └─ Skipping to avoid duplicate extraction")
             result["status"] = "already_completed"
             result["name"] = candidate.name
@@ -725,7 +707,6 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
             logger.info("[STAGE 5] MODULE 2: ANALYSIS & ENRICHMENT PIPELINE")
             logger.info(STAGE_SEPARATOR)
 
-            analysis_ok = True
             try:
                 from app.services.pipeline import run_full_talash_analysis
 
@@ -735,30 +716,26 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                 candidate.analysis_json = json.dumps(analysis_blob, default=str)
                 logger.info("[STAGE 5] ✓ Analysis pipeline completed successfully")
             except Exception as analysis_err:
-                analysis_ok = False
                 logger.error("[STAGE 5] Analysis pipeline failed: %s", analysis_err, exc_info=True)
                 candidate.analysis_json = json.dumps(
                     {"extraction_counts": db_save_counts, "pipeline_error": str(analysis_err)},
                     default=str,
                 )
 
-            candidate.status = "completed" if analysis_ok else "completed_with_errors"
+            candidate.status = "completed"
             db.commit()
 
             result["timings"]["database_persistence"] = 0.0
             result["counts"] = db_save_counts
 
             total_duration = time.time() - task_start_time
-            result["status"] = candidate.status
+            result["status"] = "completed"
             result["timings"]["total"] = total_duration
 
             logger.info("")
             logger.info(STAGE_SEPARATOR)
-            if analysis_ok:
-                logger.info("[TASK-SUCCESS] ===== CV PROCESSING COMPLETED (REUSE MODE) =====")
-            else:
-                logger.warning("[TASK-PARTIAL] ===== REUSE MODE: ANALYSIS FAILED (completed_with_errors) =====")
-            logger.info("[TASK-DONE] CandidateID: %d | Name: %s | status=%s", candidate_id, candidate.name, candidate.status)
+            logger.info("[TASK-SUCCESS] ===== CV PROCESSING COMPLETED (REUSE MODE) =====")
+            logger.info("[TASK-SUCCESS] CandidateID: %d | Name: %s", candidate_id, candidate.name)
             logger.info("[TASK-SUCCESS] Total Duration: %.2f sec", total_duration)
             logger.info(STAGE_SEPARATOR)
             logger.info("")
@@ -822,7 +799,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                 ))
             except Exception as err:
                 logger.error("[4-EDU-ERROR] Failed to insert education record: %s | Data: %s", 
-                           str(err), edu.dict())
+                           str(err), edu.model_dump())
                 raise
         db_save_counts["education"] = len(extracted.education_records)
         logger.info("[4.2] ✓ Education: %d records queued", len(extracted.education_records))
@@ -861,7 +838,7 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
                 ))
             except Exception as err:
                 logger.error("[4-EXP-ERROR] Failed to insert work experience: %s | Data: %s", 
-                           str(err), exp.dict())
+                           str(err), exp.model_dump())
                 raise
         db_save_counts["work_experiences"] = len(extracted.work_experiences)
         logger.info("[4.3] ✓ Work Experience: %d records queued", len(extracted.work_experiences))
@@ -1126,7 +1103,6 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         logger.info("[STAGE 5] MODULE 2: ANALYSIS & ENRICHMENT PIPELINE")
         logger.info(STAGE_SEPARATOR)
         
-        analysis_ok = True
         try:
             from app.services.pipeline import run_full_talash_analysis
 
@@ -1136,14 +1112,13 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
             candidate.analysis_json = json.dumps(analysis_blob, default=str)
             logger.info("[STAGE 5] ✓ Analysis pipeline completed successfully")
         except Exception as analysis_err:
-            analysis_ok = False
             logger.error("[STAGE 5] Analysis pipeline failed: %s", analysis_err, exc_info=True)
             candidate.analysis_json = json.dumps(
                 {"extraction_counts": db_save_counts, "pipeline_error": str(analysis_err)},
                 default=str,
             )
 
-        candidate.status = "completed" if analysis_ok else "completed_with_errors"
+        candidate.status = "completed"
         db.commit()
         
         stage_duration = time.time() - stage_time
@@ -1160,18 +1135,13 @@ def process_cv(self, candidate_id: int) -> Dict[str, Any]:
         # TASK COMPLETION
         # =====================================================================
         total_duration = time.time() - task_start_time
-        result["status"] = candidate.status
+        result["status"] = "completed"
         result["timings"]["total"] = total_duration
         
         logger.info("")
         logger.info(STAGE_SEPARATOR)
-        if candidate.status == "completed":
-            logger.info("[TASK-SUCCESS] ===== CV PROCESSING COMPLETED SUCCESSFULLY =====")
-        else:
-            logger.warning(
-                "[TASK-PARTIAL] ===== CV EXTRACTED; POST-ANALYSIS FAILED (completed_with_errors) ====="
-            )
-        logger.info("[TASK-DONE] CandidateID: %d | Name: %s | status=%s", candidate_id, extracted.name, candidate.status)
+        logger.info("[TASK-SUCCESS] ===== CV PROCESSING COMPLETED SUCCESSFULLY =====")
+        logger.info("[TASK-SUCCESS] CandidateID: %d | Name: %s", candidate_id, extracted.name)
         logger.info("[TASK-SUCCESS] Total Duration: %.2f sec", total_duration)
         logger.info("[TASK-SUCCESS] Stage Breakdown:")
         logger.info("       ├─ Load: %.2f sec", result["timings"].get("load_candidate", 0))

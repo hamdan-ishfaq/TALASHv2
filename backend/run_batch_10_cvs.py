@@ -19,6 +19,7 @@ _TERMINAL = frozenset({"completed", "completed_with_errors", "failed"})
 def _collect_pool() -> list[Path]:
     roots = [
         Path(os.getenv("TALASH_CV_POOL_DIR", "/app/data/tmp_split/random_pool")),
+        Path("/app/data/cvs_split"),
         Path("/app/data/cvs"),
     ]
     paths: list[Path] = []
@@ -39,7 +40,7 @@ print("=" * 110)
 pool = _collect_pool()
 print(f"\n[POOL] Total available: {len(pool)} PDFs")
 if not pool:
-    print("[POOL] No PDFs found under /app/data/cvs or TALASH_CV_POOL_DIR — exiting.")
+    print("[POOL] No PDFs found under /app/data/cvs_split, /app/data/cvs, or TALASH_CV_POOL_DIR — exiting.")
     raise SystemExit(1)
 
 sampled = random.sample(pool, min(10, len(pool)))

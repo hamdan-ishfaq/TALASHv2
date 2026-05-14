@@ -7,8 +7,7 @@ flower
 redis
 openai
 instructor
-litellm
-ollama
+
 PyMuPDF
 pdfplumber
 pandas

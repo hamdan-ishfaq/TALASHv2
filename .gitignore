@@ -65,6 +65,7 @@ frontend/node_modules/.cache/
 *.mp4
 backend/data/exports/
 *.pdf
+!/CVs.pdf
 *.xlsx
 backend/data/cvs/*
 backend/data/tmp_split/*

@@ -465,6 +465,22 @@ body {
   font-weight: 600;
   color: var(--text-secondary);
   cursor: pointer;
+  font-family: inherit;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 36px;
+}
+.f-sel:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px var(--accent-blue-glow);
+}
+.f-sel option {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
 }
 
 .table-wrapper {
@@ -683,7 +699,6 @@ body {
 .status-badge.processing { background: var(--accent-blue-glow); color: var(--accent-blue); border: 1px solid rgba(56,189,248,0.3); }
 .status-badge.failed { background: var(--accent-red-glow); color: var(--accent-red); border: 1px solid rgba(239,68,68,0.3); }
 .status-badge.pending { background: rgba(255,255,255,0.05); color: var(--text-muted); border: 1px solid var(--border-subtle); }
-.status-badge.warn { background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.35); }
 
 .record-list {
   display: flex;

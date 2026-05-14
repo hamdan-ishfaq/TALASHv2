@@ -23,7 +23,6 @@ services:
     container_name: talashv3-backend
     build:
       context: ./backend
-    mem_limit: 2g
     working_dir: /app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     env_file:
@@ -32,15 +31,13 @@ services:
       - LLM_PROVIDER=openrouter
       - DATABASE_URL=postgresql+psycopg2://talash:talash@db:5432/talash
       - REDIS_URL=redis://redis:6379/0
-      - TALASH_OPENALEX_MAILTO=mhamdanishfaq@gmail.com
-      - OPENROUTER_INTER_REQUEST_DELAY=2
     volumes:
       - ./backend:/app
       - ./backend/data/cvs:/app/data/cvs
       - ./CORE.csv:/app/CORE.csv:ro
       - "./scimagojr 2025.csv:/app/scimagojr_2025.csv:ro"
       # Optional: add a *QS*.xlsx in project root for institution rankings, or mount here.
-      # - "./2026 QS World University Rankings 1.3 (For qs.com).xlsx:/app/QS_Rankings.xlsx:ro"
+      - "./2026 QS World University Rankings 1.3 (For qs.com).xlsx:/app/QS_Rankings.xlsx:ro"
     ports:
       - "8000:8000"
     depends_on:
@@ -51,7 +48,6 @@ services:
     container_name: talashv3-worker
     build:
       context: ./backend
-    mem_limit: 2g
     working_dir: /app
     command: celery -A app.worker worker --loglevel=info --concurrency=1 --prefetch-multiplier=1
     env_file:
@@ -60,15 +56,13 @@ services:
       - LLM_PROVIDER=openrouter
       - DATABASE_URL=postgresql+psycopg2://talash:talash@db:5432/talash
       - REDIS_URL=redis://redis:6379/0
-      - TALASH_OPENALEX_MAILTO=mhamdanishfaq@gmail.com
-      - OPENROUTER_INTER_REQUEST_DELAY=2
     volumes:
       - ./backend:/app
       - ./backend/data/cvs:/app/data/cvs
       - ./CORE.csv:/app/CORE.csv:ro
       - "./scimagojr 2025.csv:/app/scimagojr_2025.csv:ro"
       # Optional: add a *QS*.xlsx in project root for institution rankings, or mount here.
-      # - "./2026 QS World University Rankings 1.3 (For qs.com).xlsx:/app/QS_Rankings.xlsx:ro"
+      - "./2026 QS World University Rankings 1.3 (For qs.com).xlsx:/app/QS_Rankings.xlsx:ro"
     depends_on:
       - db
       - redis

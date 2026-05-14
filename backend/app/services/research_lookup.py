@@ -60,7 +60,8 @@ class ScimagoLookup:
     def get(cls) -> "ScimagoLookup":
         if cls._instance is None:
             # Search project root
-            search_roots = [Path("/home/mhamd/talashv3"), Path.cwd(), Path("/app")]
+            import os
+            search_roots = [Path(os.getenv("TALASH_HOME", "/home/mhamd/talashv3")), Path.cwd(), Path("/app")]
             try: search_roots.append(Path(__file__).resolve().parents[4])
             except IndexError: pass
             
@@ -146,7 +147,8 @@ class CoreLookup:
     def get(cls) -> "CoreLookup":
         if cls._instance is None:
             # Search project root
-            search_roots = [Path("/home/mhamd/talashv3"), Path.cwd(), Path("/app")]
+            import os
+            search_roots = [Path(os.getenv("TALASH_HOME", "/home/mhamd/talashv3")), Path.cwd(), Path("/app")]
             try: search_roots.append(Path(__file__).resolve().parents[4])
             except IndexError: pass
             

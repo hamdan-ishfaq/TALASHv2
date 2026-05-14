@@ -61,7 +61,17 @@ Services:
 - Redis: `localhost:6379`
 - Flower: <http://localhost:5555>
 
-Place CV PDFs under **`backend/data/cvs/`** (mounted at `/app/data/cvs` in containers) for uploads or folder monitoring.
+- **Watcher / hot folder:** put PDFs you want processed under **`backend/data/cvs/`** (mounted at `/app/data/cvs`). The API folder monitor only watches this directory.
+- **Merged bundle:** keep a single **`CVs.pdf`** at the **repository root** (optional to track; see `.gitignore` exception). Split it into per-CV files with blank-page separators — outputs go to **`backend/data/cvs_split/`**, not the watcher folder. Then copy only the PDFs you want into `backend/data/cvs/` (or upload via `/docs`).
+
+```bash
+# Host (repo root), needs PyMuPDF (also installed in the backend image):
+python3 backend/scripts/split_cvs_bundle.py --clear-output
+
+# Or inside Docker:
+docker compose exec backend python scripts/split_cvs_bundle.py --clear-output
+# If CVs.pdf is not under /app, pass: --input /path/to/CVs.pdf
+```
 
 Optional data files (see `docker-compose.yml` comments):
 
@@ -92,7 +102,7 @@ docker compose exec worker bash
 # Flush DB (drops and recreates tables + optional columns)
 docker compose exec worker python flush_db.py
 
-# Batch sample (up to 10 random PDFs from pool + data/cvs)
+# Batch sample (up to 10 random PDFs from pool + cvs_split + data/cvs)
 docker compose exec worker python run_batch_10_cvs.py
 ```
 
@@ -105,6 +115,7 @@ Working directory in containers: **`/app`** (mapped to `./backend`).
 | Path | Role |
 |------|------|
 | `backend/app/` | FastAPI app, routers, models, services |
+| `backend/scripts/split_cvs_bundle.py` | Split root `CVs.pdf` into `backend/data/cvs_split/` (blank-page separators) |
 | `backend/worker/` | Celery tasks (CV pipeline) |
 | `frontend/` | React SPA |
 | `docker-compose.yml` | Local full stack |
